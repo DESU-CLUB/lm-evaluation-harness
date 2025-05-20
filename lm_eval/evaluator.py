@@ -574,6 +574,8 @@ def evaluate(
         # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):
             req.resps.append(x)
+            print(type(x))
+            print(x)
 
         if lm.world_size > 1:
             lm.accelerator.wait_for_everyone()
