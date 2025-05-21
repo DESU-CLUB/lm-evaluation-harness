@@ -1247,8 +1247,10 @@ class HFLM(TemplateLM):
                     cont_toks = torch.tensor(
                         cont_toks, dtype=torch.long, device=self.device
                     ).unsqueeze(0)  # [1, seq]
+                    print(logits.shape)
                     max_equal = (greedy_tokens == cont_toks).all()
-
+                    
+                    full_logits = logits.clone()
                     # Obtain log-probs at the corresponding continuation token indices
                     # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
                     logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(
@@ -1256,7 +1258,7 @@ class HFLM(TemplateLM):
                     )  # [1, seq]
 
                     # Answer: (log prob, is-exact-match)
-                    answer = (float(logits.sum()), bool(max_equal))
+                    answer = (float(logits.sum()), bool(max_equal), full_logits)
 
                     res.append(answer)
 

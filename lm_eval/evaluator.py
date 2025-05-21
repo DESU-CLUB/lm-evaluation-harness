@@ -36,6 +36,7 @@ from lm_eval.utils import (
 )
 
 
+
 if TYPE_CHECKING:
     from lm_eval.api.model import LM
     from lm_eval.api.task import Task
@@ -557,6 +558,7 @@ def evaluate(
 
     ### Run LM on inputs, get all outputs ###
     # execute each type of request
+    tensor_list = []
     for reqtype, reqs in requests.items():
         eval_logger.info(f"Running {reqtype} requests")
         # create `K` copies of each request `req` based off `K = req.repeats`
@@ -573,13 +575,54 @@ def evaluate(
 
         # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):
-            req.resps.append(x)
-            print(type(x))
-            print(x)
-
+            if type(lm) == lm_eval.models.huggingface.HFLM:
+                req.resps.append(x[:2])
+                tensor_list.append(x[2])
+            else:
+                req.resps.append(x)
         if lm.world_size > 1:
             lm.accelerator.wait_for_everyone()
-
+    if type(lm) == lm_eval.models.huggingface.HFLM and log_samples:
+    # Create a structured list with task information
+        structured_tensors = []
+        tensor_index = 0
+        
+        for task_output, limit in zip(eval_tasks, limits):
+            task = task_output.task
+            task_name = task_output.task_name
+            
+            # Determine task type
+            task_type = task.OUTPUT_TYPE  # Usually "multiple_choice" or "generate_until"
+            
+            task_data = {
+                "task_name": task_name,
+                "task_type": task_type,
+                "tensors": []
+            }
+            
+            # For MCQ tasks, track options per question
+            if task_type == "multiple_choice":
+                # Group instances by doc_id to identify questions
+                instances_by_doc_id = defaultdict(list)
+                for instance in task.instances:
+                    instances_by_doc_id[instance.doc_id].append(instance)
+                
+                # Count options per question
+                options_per_question = []
+                for doc_id, instances in instances_by_doc_id.items():
+                    options_per_question.append(len(instances))
+                
+                task_data["options_per_question"] = options_per_question
+            
+            # Get tensors for this task
+            task_tensors_count = len(task.instances)
+            task_data["tensors"] = tensor_list[tensor_index:tensor_index+task_tensors_count]
+            tensor_index += task_tensors_count
+            
+            structured_tensors.append(task_data)
+    
+    # Save structured data
+    torch.save(structured_tensors, f"{lm._model.config._name_or_path.split('/')[-1]}_tensors_by_task.pt")
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
     ### Postprocess outputs ###

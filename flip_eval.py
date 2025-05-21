@@ -160,8 +160,8 @@ class FlipEval:
 
 if __name__ == "__main__":
     # Example usage:
-    BASE_FILE_PATH = "output/deepseek-ai__DeepSeek-R1-Distill-Qwen-1.5B/samples_hellaswag_2025-05-21T00-44-07.577199.jsonl"
-    NEW_FILE_PATH = "output/unsloth__DeepSeek-R1-Distill-Qwen-1.5B-bnb-4bit/samples_hellaswag_2025-05-21T00-47-34.834490.jsonl"
+    BASE_FILE_PATH = "/home/spooky/Documents/smol_projects/inference/lm-evaluation-harness/output/deepseek-ai__DeepSeek-R1-Distill-Qwen-1.5B/samples_mmlu_world_religions_2025-05-21T13-16-46.241074.jsonl"
+    NEW_FILE_PATH = "/home/spooky/Documents/smol_projects/inference/lm-evaluation-harness/output/unsloth__DeepSeek-R1-Distill-Qwen-1.5B-bnb-4bit/samples_mmlu_world_religions_2025-05-21T13-26-19.911843.jsonl"
     fe = FlipEval(BASE_FILE_PATH, NEW_FILE_PATH)
     stats = fe.count_flips(verbose=True)
 
