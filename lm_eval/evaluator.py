@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import numpy as np
 import torch
+import os
 
 import lm_eval.api.metrics
 import lm_eval.api.registry
@@ -77,6 +78,7 @@ def simple_evaluate(
     fewshot_random_seed: int = 1234,
     confirm_run_unsafe_code: bool = False,
     metadata: Optional[dict] = None,
+    output_path: Optional[str] = None,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -141,6 +143,8 @@ def simple_evaluate(
         Random seed for fewshot sampler random generator. If set to None, the seed of generator will be set to None.
     :param metadata: dict
         Additional metadata to be added to the task manager. Will get passed to the download function of the task.
+    :param output_path: str or None
+        Path to store output files like logits. If None, default locations will be used.
 
     return
         Dictionary of results
@@ -351,6 +355,7 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
+        output_path=output_path,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -415,6 +420,7 @@ def evaluate(
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
     question_suffix: Optional[str] = None,
+    output_path: Optional[str] = None,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -449,6 +455,8 @@ def evaluate(
         Verbosity level for logging
     :param confirm_run_unsafe_code: bool
         Whether to confirm running tasks marked as unsafe.
+    :param output_path: str or None
+        Path to store output files like logits. If None, default locations will be used.
     :return
         Dictionary of results
     """
@@ -559,6 +567,34 @@ def evaluate(
     ### Run LM on inputs, get all outputs ###
     # execute each type of request
     tensor_list = []
+    tensor_chunk_size = 500  # Save tensors in chunks of 1000 to prevent excessive memory usage
+    tensor_chunks_saved = 0
+    
+    # Prepare for chunked tensor saving
+    if type(lm) == lm_eval.models.huggingface.HFLM and log_samples:
+        # Process and save tensors by task to avoid memory issues
+        model_name = lm._model.config._name_or_path.split('/')[-1]
+        
+        # Extract task name from the first task for folder naming
+        first_task_name = eval_tasks[0].task_name if eval_tasks else "unknown_task"
+        # Get the base task name without subtask (e.g., "mmlu" from "mmlu_astronomy")
+        base_task_name = first_task_name.split('_')[0] if '_' in first_task_name else first_task_name
+        
+        # Check if output_path is provided from the parent function
+        if output_path:
+            # Use the provided output path with {task_name}_logits subfolder
+            output_dir = os.path.join(output_path, f"{base_task_name}_logits")
+        else:
+            # Fallback to the old behavior if no output path is provided
+            output_dir = f"{model_name}_tensor_chunks"
+        
+        # Create directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create a temporary chunk directory
+        temp_chunk_dir = os.path.join(output_dir, "temp_chunks")
+        os.makedirs(temp_chunk_dir, exist_ok=True)
+    
     for reqtype, reqs in requests.items():
         eval_logger.info(f"Running {reqtype} requests")
         # create `K` copies of each request `req` based off `K = req.repeats`
@@ -578,21 +614,47 @@ def evaluate(
             if type(lm) == lm_eval.models.huggingface.HFLM:
                 req.resps.append(x[:2])
                 tensor_list.append(x[2])
+                # Save tensors in chunks to prevent memory buildup
+                if log_samples and len(tensor_list) >= tensor_chunk_size:
+                    chunk_file = f"{temp_chunk_dir}/tensor_chunk_{tensor_chunks_saved}.pt"
+                    torch.save(tensor_list, chunk_file)
+                    tensor_chunks_saved += 1
+                    # Clear the list to free memory
+                    tensor_list = []
+                    # Explicitly call garbage collection
+                    import gc
+                    gc.collect()
+                    # Free CUDA memory if possible
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             else:
                 req.resps.append(x)
         if lm.world_size > 1:
             lm.accelerator.wait_for_everyone()
+            
     if type(lm) == lm_eval.models.huggingface.HFLM and log_samples:
-    # Create a structured list with task information
-        structured_tensors = []
+        # Save any remaining tensors
+        if tensor_list:
+            chunk_file = f"{temp_chunk_dir}/tensor_chunk_{tensor_chunks_saved}.pt"
+            torch.save(tensor_list, chunk_file)
+            tensor_chunks_saved += 1
+            # Clear the list to free memory
+            tensor_list = []
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        # Now process and organize saved chunks by task
         tensor_index = 0
+        task_files = []
         
         for task_output, limit in zip(eval_tasks, limits):
             task = task_output.task
             task_name = task_output.task_name
             
             # Determine task type
-            task_type = task.OUTPUT_TYPE  # Usually "multiple_choice" or "generate_until"
+            task_type = task.OUTPUT_TYPE
             
             task_data = {
                 "task_name": task_name,
@@ -602,27 +664,73 @@ def evaluate(
             
             # For MCQ tasks, track options per question
             if task_type == "multiple_choice":
-                # Group instances by doc_id to identify questions
                 instances_by_doc_id = defaultdict(list)
                 for instance in task.instances:
                     instances_by_doc_id[instance.doc_id].append(instance)
                 
-                # Count options per question
                 options_per_question = []
                 for doc_id, instances in instances_by_doc_id.items():
                     options_per_question.append(len(instances))
                 
                 task_data["options_per_question"] = options_per_question
             
-            # Get tensors for this task
+            # Get tensors for this task from chunks
             task_tensors_count = len(task.instances)
-            task_data["tensors"] = tensor_list[tensor_index:tensor_index+task_tensors_count]
+            remaining_count = task_tensors_count
+            current_index = tensor_index
+            
+            # Reconstruct tensors for this task from chunks
+            eval_logger.info(f"Collecting tensors for task {task_name} from chunks")
+            all_tensors = []
+            
+            # Load tensors from chunks efficiently
+            for i in range(tensor_chunks_saved):
+                chunk_file = f"{temp_chunk_dir}/tensor_chunk_{i}.pt"
+                chunk_tensors = torch.load(chunk_file)
+                
+                # Get tensors that overlap with the current task range
+                start_idx = max(0, current_index - i * tensor_chunk_size)
+                end_idx = min(len(chunk_tensors), (current_index + remaining_count) - i * tensor_chunk_size)
+                
+                if start_idx < len(chunk_tensors) and end_idx > 0 and start_idx < end_idx:
+                    # Take relevant subset from this chunk
+                    relevant_tensors = chunk_tensors[start_idx:end_idx]
+                    all_tensors.extend(relevant_tensors)
+                    taken_count = len(relevant_tensors)
+                    remaining_count -= taken_count
+                    current_index += taken_count
+                
+                # Stop if we've collected all tensors for this task
+                if remaining_count <= 0:
+                    break
+            
+            task_data["tensors"] = all_tensors
+            
+            # Save this task's data separately
+            task_file = f"{output_dir}/{task_name}.pt"
+            torch.save(task_data, task_file)
+            task_files.append({"task_name": task_name, "file": task_file})
+            
+            # Free memory
+            del task_data["tensors"]
+            del all_tensors
             tensor_index += task_tensors_count
             
-            structured_tensors.append(task_data)
-    
-    # Save structured data
-    torch.save(structured_tensors, f"{lm._model.config._name_or_path.split('/')[-1]}_tensors_by_task.pt")
+            # Log progress
+            eval_logger.info(f"Saved tensors for task {task_name} to {task_file}")
+        
+        # Save a manifest file with paths to all task files
+        manifest = {
+            "model": model_name,
+            "task_files": task_files
+        }
+        torch.save(manifest, f"{output_dir}/manifest.pt")
+        
+        # Clean up temp chunk directory
+        import shutil
+        shutil.rmtree(temp_chunk_dir, ignore_errors=True)
+        
+        eval_logger.info(f"Saved all tensor data to {output_dir}/")
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
     ### Postprocess outputs ###
@@ -654,43 +762,70 @@ def evaluate(
                 world_size=WORLD_SIZE,
                 samples=indices,
             )
+            
+            # For large tasks like hellaswag, process in smaller batches
+            doc_batch_size = 500  # Process 500 documents at a time
+            doc_batches = []
+            current_batch = []
+            
+            # Create batches of documents to process
             for doc_id, doc in doc_iterator:
-                if indices:
-                    doc_id_true = indices[doc_id]
-                else:
-                    doc_id_true = doc_id
-                requests = instances_by_doc_id[doc_id]
-                metrics = task.process_results(
-                    doc, [req.filtered_resps[filter_key] for req in requests]
-                )
-                if log_samples:
-                    target = task.doc_to_target(doc)
-                    example = {
-                        "doc_id": doc_id_true,
-                        "doc": doc,
-                        "target": target,
-                        "arguments": [req.args for req in requests],
-                        "resps": [req.resps for req in requests],
-                        "filtered_resps": [
-                            req.filtered_resps[filter_key] for req in requests
-                        ],
-                        "filter": filter_key,
-                        "metrics": list(metrics.keys()),
-                        "doc_hash": hash_string(
-                            json.dumps(
-                                requests[0].doc,
-                                indent=2,
-                                default=handle_non_serializable,
-                                ensure_ascii=False,
-                            )
-                        ),
-                        "prompt_hash": hash_string(requests[0].arguments[0]),
-                        "target_hash": hash_string(str(target)),
-                    }
-                    example.update(metrics)
-                    task_output.logged_samples.append(example)
-                for metric, value in metrics.items():
-                    task_output.sample_metrics[(metric, filter_key)].append(value)
+                current_batch.append((doc_id, doc))
+                if len(current_batch) >= doc_batch_size:
+                    doc_batches.append(current_batch)
+                    current_batch = []
+            
+            # Add any remaining documents
+            if current_batch:
+                doc_batches.append(current_batch)
+            
+            # Process each batch
+            for batch_idx, doc_batch in enumerate(doc_batches):
+                eval_logger.info(f"Processing document batch {batch_idx+1}/{len(doc_batches)} for task {task_output.task_name}")
+                
+                for doc_id, doc in doc_batch:
+                    if indices:
+                        doc_id_true = indices[doc_id]
+                    else:
+                        doc_id_true = doc_id
+                    requests = instances_by_doc_id[doc_id]
+                    metrics = task.process_results(
+                        doc, [req.filtered_resps[filter_key] for req in requests]
+                    )
+                    if log_samples:
+                        target = task.doc_to_target(doc)
+                        example = {
+                            "doc_id": doc_id_true,
+                            "doc": doc,
+                            "target": target,
+                            "arguments": [req.args for req in requests],
+                            "resps": [req.resps for req in requests],
+                            "filtered_resps": [
+                                req.filtered_resps[filter_key] for req in requests
+                            ],
+                            "filter": filter_key,
+                            "metrics": list(metrics.keys()),
+                            "doc_hash": hash_string(
+                                json.dumps(
+                                    requests[0].doc,
+                                    indent=2,
+                                    default=handle_non_serializable,
+                                    ensure_ascii=False,
+                                )
+                            ),
+                            "prompt_hash": hash_string(requests[0].arguments[0]),
+                            "target_hash": hash_string(str(target)),
+                        }
+                        example.update(metrics)
+                        task_output.logged_samples.append(example)
+                    for metric, value in metrics.items():
+                        task_output.sample_metrics[(metric, filter_key)].append(value)
+                
+                # Free memory after processing each batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import gc
+                gc.collect()
 
     if WORLD_SIZE > 1:
         # if multigpu, then gather data across all ranks to rank 0
