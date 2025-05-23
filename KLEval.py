@@ -2,6 +2,7 @@ import torch
 import os
 from typing import Dict, List, Any, Optional
 import glob
+import json
 
 class KLEval:
     def __init__(self, base_model_dir: str, new_model_dir: str):
@@ -36,18 +37,59 @@ class KLEval:
                 logit_dirs = [d for d in os.listdir(model_dir) if d.endswith("_logits") and os.path.isdir(os.path.join(model_dir, d))]
                 for logit_dir in logit_dirs:
                     task_files.extend(glob.glob(os.path.join(model_dir, logit_dir, "*.pt")))
+                
+                # Look for *_tensors subdirectories (new format)
+                tensor_dirs = [d for d in os.listdir(model_dir) if d.endswith("_tensors") and os.path.isdir(os.path.join(model_dir, d))]
+                task_files_from_tensors = []
+                
+                for tensor_dir in tensor_dirs:
+                    # Check for manifest.json in the tensor directory
+                    tensor_dir_path = os.path.join(model_dir, tensor_dir)
+                    manifest_json_path = os.path.join(tensor_dir_path, "manifest.json")
+                    
+                    if os.path.exists(manifest_json_path):
+                        # Use the manifest to get task info
+                        with open(manifest_json_path, 'r') as f:
+                            tensor_manifest = json.load(f)
+                        
+                        task_name = tensor_manifest.get('task_name', os.path.basename(tensor_dir).replace("_tensors", ""))
+                        task_files_from_tensors.append({
+                            "task_name": task_name,
+                            "is_tensor_dir": True,
+                            "dir_path": tensor_dir_path,
+                            "tensor_count": tensor_manifest.get('tensor_count', 0)
+                        })
+                    else:
+                        # No manifest, try to infer from directory structure
+                        task_name = os.path.basename(tensor_dir).replace("_tensors", "")
+                        # Count tensor files
+                        tensor_files = glob.glob(os.path.join(tensor_dir_path, "tensor_*.pt"))
+                        task_files_from_tensors.append({
+                            "task_name": task_name,
+                            "is_tensor_dir": True,
+                            "dir_path": tensor_dir_path,
+                            "tensor_count": len(tensor_files)
+                        })
             
-            if not task_files:
-                raise FileNotFoundError(f"No manifest.pt or task tensor files found in {model_dir}")
+            if not task_files and not task_files_from_tensors:
+                raise FileNotFoundError(f"No manifest.pt, task tensor files, or tensor directories found in {model_dir}")
                 
             # Create a synthetic manifest
-            return {
-                "model": os.path.basename(model_dir),
-                "task_files": [
-                    {"task_name": os.path.basename(f).replace(".pt", ""), "file": f}
-                    for f in task_files
-                ]
-            }
+            if task_files:
+                # Old format with individual task files
+                return {
+                    "model": os.path.basename(model_dir),
+                    "task_files": [
+                        {"task_name": os.path.basename(f).replace(".pt", ""), "file": f}
+                        for f in task_files
+                    ]
+                }
+            else:
+                # New format with tensor directories
+                return {
+                    "model": os.path.basename(model_dir),
+                    "task_files": task_files_from_tensors
+                }
     
     def _get_matching_task_files(self, task_filter: str = None) -> List[Dict[str, Any]]:
         """
@@ -56,23 +98,23 @@ class KLEval:
         Args:
             task_filter: Optional filter to only process specific task(s)
         """
-        # Filter out manifest.pt from task files
-        base_tasks = {
-            task_file["task_name"]: task_file["file"] 
-            for task_file in self.base_manifest.get("task_files", [])
-            if task_file["task_name"].lower() != "manifest"  # Explicitly filter out manifest.pt
-        }
+        # Filter out manifest.pt from task files and extract task names
+        base_tasks = {}
+        for task_file in self.base_manifest.get("task_files", []):
+            task_name = task_file["task_name"]
+            if task_name.lower() != "manifest":  # Explicitly filter out manifest.pt
+                base_tasks[task_name] = task_file
         
-        new_tasks = {
-            task_file["task_name"]: task_file["file"] 
-            for task_file in self.new_manifest.get("task_files", [])
-            if task_file["task_name"].lower() != "manifest"  # Explicitly filter out manifest.pt
-        }
+        new_tasks = {}
+        for task_file in self.new_manifest.get("task_files", []):
+            task_name = task_file["task_name"]
+            if task_name.lower() != "manifest":  # Explicitly filter out manifest.pt
+                new_tasks[task_name] = task_file
         
         # Apply task filter if specified
         if task_filter:
-            base_tasks = {name: path for name, path in base_tasks.items() if task_filter in name}
-            new_tasks = {name: path for name, path in new_tasks.items() if task_filter in name}
+            base_tasks = {name: info for name, info in base_tasks.items() if task_filter in name}
+            new_tasks = {name: info for name, info in new_tasks.items() if task_filter in name}
             print(f"Filtered to tasks matching '{task_filter}'")
         
         print(f"Base model tasks after filtering: {list(base_tasks.keys())}")
@@ -89,11 +131,46 @@ class KLEval:
         return [
             {
                 "task_name": task_name,
-                "base_file": base_tasks[task_name],
-                "new_file": new_tasks[task_name]
+                "base_info": base_tasks[task_name],
+                "new_info": new_tasks[task_name]
             }
             for task_name in common_tasks
         ]
+    
+    def _load_tensors_from_directory(self, tensor_dir: str, start_idx: int = 0, end_idx: int = None) -> List[torch.Tensor]:
+        """
+        Load tensors from a directory containing individual tensor files
+        
+        Args:
+            tensor_dir: Directory containing tensor_*.pt files
+            start_idx: Starting index for tensors to load
+            end_idx: Ending index for tensors to load (None means load all)
+            
+        Returns:
+            List of loaded tensors
+        """
+        if end_idx is None:
+            # Try to get tensor count from manifest
+            manifest_path = os.path.join(tensor_dir, "manifest.json")
+            if os.path.exists(manifest_path):
+                with open(manifest_path, 'r') as f:
+                    manifest = json.load(f)
+                end_idx = manifest.get("tensor_count", 0)
+            
+            # If still None, count files
+            if end_idx is None or end_idx == 0:
+                tensor_files = glob.glob(os.path.join(tensor_dir, "tensor_*.pt"))
+                end_idx = len(tensor_files)
+        
+        tensors = []
+        for i in range(start_idx, end_idx):
+            tensor_path = os.path.join(tensor_dir, f"tensor_{i:06d}.pt")
+            if os.path.exists(tensor_path):
+                tensors.append(torch.load(tensor_path))
+            else:
+                print(f"Warning: Missing tensor file {tensor_path}")
+        
+        return tensors
 
     @torch.no_grad()
     def calculate_per_task_kl(self, task_filter: str = None, return_details: bool = False) -> Dict[str, Any]:
@@ -116,9 +193,44 @@ class KLEval:
             print(f"Processing task: {task_name}")
             
             try:
-                # Load task tensors
-                base_task_data = torch.load(task_info["base_file"])
-                new_task_data = torch.load(task_info["new_file"])
+                # Handle both old and new tensor formats
+                base_info = task_info["base_info"]
+                new_info = task_info["new_info"]
+                
+                # Check if this is a tensor directory format
+                if "is_tensor_dir" in base_info and base_info["is_tensor_dir"]:
+                    # New format with individual tensor files
+                    print(f"Loading tensors from directories")
+                    base_tensors = self._load_tensors_from_directory(base_info["dir_path"])
+                    new_tensors = self._load_tensors_from_directory(new_info["dir_path"])
+                    
+                    # Create synthetic task data
+                    base_task_data = {
+                        "task_name": task_name,
+                        "task_type": "multiple_choice" if "hellaswag" in task_name.lower() else "generative",
+                        "tensors": base_tensors
+                    }
+                    
+                    new_task_data = {
+                        "task_name": task_name,
+                        "task_type": base_task_data["task_type"],
+                        "tensors": new_tensors
+                    }
+                    
+                    # For MCQ tasks like hellaswag, try to determine options_per_question
+                    if base_task_data["task_type"] == "multiple_choice":
+                        # For hellaswag, each question typically has 4 options
+                        base_task_data["options_per_question"] = [4] * (len(base_tensors) // 4)
+                        if len(base_tensors) % 4 != 0:
+                            print(f"Warning: {task_name} has {len(base_tensors)} tensors, which is not a multiple of 4. Handling remainder.")
+                            # Add the remainder
+                            base_task_data["options_per_question"].append(len(base_tensors) % 4)
+                else:
+                    # Load task tensors from old format
+                    base_file = base_info["file"]
+                    new_file = new_info["file"]
+                    base_task_data = torch.load(base_file)
+                    new_task_data = torch.load(new_file)
                 
                 # Check for task type consistency
                 if "task_type" not in base_task_data:
@@ -172,7 +284,11 @@ class KLEval:
                             new_sample = new_task_tensors[option_index]
                             
                             # Calculate KL for this option
-                            print(base_sample)
+                            # Debug info for first tensor
+                            if question_idx == 0 and i == 0:
+                                print(f"Sample tensor type: {type(base_sample)}")
+                                print(f"Sample tensor shape: {base_sample.shape}")
+                            
                             if base_sample.shape != new_sample.shape:
                                 print(f"Skipping option with mismatched shape in question {question_idx}: {base_sample.shape} vs {new_sample.shape}")
                                 option_index += 1
@@ -209,9 +325,11 @@ class KLEval:
                 else:
                     # For generative tasks - simpler calculation
                     sample_kls = []
-                    for base_sample, new_sample in zip(base_task_tensors, new_task_tensors):
-                        print(base_task_tensors)
-                        print("Base sample: ", base_sample)
+                    for idx, (base_sample, new_sample) in enumerate(zip(base_task_tensors, new_task_tensors)):
+                        # Debug info for first tensor
+                        if idx == 0:
+                            print(f"Sample tensor shape: {base_sample.shape}")
+                        
                         if base_sample.shape != new_sample.shape:
                             print(f"Skipping sample with mismatched shapes in task {task_name}")
                             continue
@@ -240,8 +358,19 @@ class KLEval:
                     }
                     if return_details:
                         results[task_name]["per_sample_kls"] = sample_kls
+                
+                # Clean up to save memory
+                del base_task_tensors
+                del new_task_tensors
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
             except Exception as e:
                 print(f"Error processing task {task_name}: {e}")
+                import traceback
+                traceback.print_exc()
         
         # Calculate overall KL across all tasks
         if results:

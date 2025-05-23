@@ -1052,31 +1052,24 @@ class HFLM(TemplateLM):
         # TODO: implement some kind of efficient-request-middleware that lumps together requests with the same context
         res = []
 
-        # Stream results to JSONL file for large tasks
-        is_large_task = len(requests) > 10000
+        # Setup for saving logits to disk in chunks for all tasks
+        from pathlib import Path
+        import json
+        import os
         
-        if is_large_task:
-            from pathlib import Path
-            import json
-            import os
-            
-            # Create output directory for logits
-            eval_logger = logging.getLogger("lm-eval")
-            eval_logger.info(f"Detected large task with {len(requests)} requests. Streaming results to disk.")
-            
-            output_dir = os.environ.get("LOGITS_OUTPUT_DIR", "logits_output")
-            Path(output_dir).mkdir(parents=True, exist_ok=True)
-            
-            # Use task name if available in the request
-            task_name = "unknown_task"
-            if requests and hasattr(requests[0], "task_name"):
-                task_name = requests[0].task_name
-            
-            out_path = Path(output_dir) / f"loglikelihood_{task_name}.jsonl"
-            out_f = out_path.open("a")    # append-mode JSONL
-            
-            buffer = []                   # small in-memory buffer
-            buffer_size = 200             # flush every 200 records
+        # Create output directory for logits
+        output_dir = os.environ.get("LOGITS_OUTPUT_DIR", "logits_output")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        # Use task name if available in the request
+        task_name = "unknown_task"
+        if hasattr(requests, "task_name"):
+            task_name = requests.task_name
+        
+        logits_dir = Path(output_dir) / f"{task_name}_tensors"
+        logits_dir.mkdir(parents=True, exist_ok=True)
+        
+        tensor_count = 0  # Counter for naming tensor files
 
         def _collate(req: Tuple[Tuple[str, str], List[int], List[int]]):
             """Defines the key for the sorted method"""
@@ -1126,6 +1119,7 @@ class HFLM(TemplateLM):
         )
         
         # For large tasks, use a fixed small batch size
+        is_large_task = n_reordered_requests > 10000
         if is_large_task and (batch_size > 100 or batch_size == 0):
             batch_size = 100
             batch_fn = None
@@ -1281,35 +1275,20 @@ class HFLM(TemplateLM):
                     ).unsqueeze(0)  # [1, seq]
                     max_equal = (greedy_tokens == cont_toks).all()
                     
-                    # For large tasks, don't store the full logits tensor to save memory
-                    if is_large_task:
-                        # Get log probs at continuation token positions without storing whole tensor
-                        logits_result = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)  # [1, seq]
-                        log_prob = float(logits_result.sum())
-                        
-                        # Append to buffer
-                        buffer.append({
-                            "request": request_str if request_str is not None else "None",
-                            "score": log_prob,
-                            "match": bool(max_equal),
-                            # We don't include logits to save memory
-                        })
-                        
-                        # Once buffer is "big enough", flush it
-                        if len(buffer) >= buffer_size:
-                            for record in buffer:
-                                out_f.write(json.dumps(record) + "\n")
-                            out_f.flush()
-                            buffer.clear()
-                            
-                        # For compatibility with the rest of the function
-                        answer = (log_prob, bool(max_equal), None)
-                    else:
-                        # For smaller tasks, keep the full logits as before
-                        full_logits = logits.clone().detach().cpu()
-                        logits_result = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)  # [1, seq]
-                        answer = (float(logits_result.sum()), bool(max_equal), full_logits)
-
+                    # Always save full logits to disk regardless of task size
+                    # Clone and move to CPU to avoid memory issues
+                    full_logits = logits.clone().detach().cpu()
+                    
+                    # Save tensor to disk
+                    tensor_path = logits_dir / f"tensor_{tensor_count:06d}.pt"
+                    torch.save(full_logits, tensor_path)
+                    tensor_count += 1
+                    
+                    # Calculate log probabilities for the standard return value
+                    logits_result = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)  # [1, seq]
+                    
+                    # Return score and match, but not full logits in memory
+                    answer = (float(logits_result.sum()), bool(max_equal), None)
                     res.append(answer)
 
                     if request_str is not None:
@@ -1321,22 +1300,25 @@ class HFLM(TemplateLM):
                         )
                     pbar.update(1)
 
-            # Manually trigger garbage collection and CUDA cache clearing after each chunk
-            if is_large_task:
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # Manually trigger garbage collection after each chunk
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         pbar.close()
         
-        # For large tasks, flush any remaining buffer items and close file
-        if is_large_task:
-            for record in buffer:
-                out_f.write(json.dumps(record) + "\n")
-            out_f.flush()
-            out_f.close()
-            eval_logger.info(f"Results saved to {out_path}")
+        # Create a manifest file that maps task to tensor files
+        manifest = {
+            "task_name": task_name,
+            "tensor_dir": str(logits_dir),
+            "tensor_count": tensor_count,
+        }
+        
+        with open(logits_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+            
+        eval_logger.info(f"Saved {tensor_count} tensor files to {logits_dir}")
 
         return re_ord.get_original(res)
 

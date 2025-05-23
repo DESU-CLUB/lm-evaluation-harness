@@ -656,10 +656,15 @@ def evaluate(
             # Determine task type
             task_type = task.OUTPUT_TYPE
             
-            task_data = {
+            # Create task-specific tensor directory using our new approach
+            from pathlib import Path
+            task_tensor_dir = Path(output_dir) / f"{task_name}_tensors"
+            task_tensor_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Collect metadata for the task
+            task_metadata = {
                 "task_name": task_name,
                 "task_type": task_type,
-                "tensors": []
             }
             
             # For MCQ tasks, track options per question
@@ -672,18 +677,18 @@ def evaluate(
                 for doc_id, instances in instances_by_doc_id.items():
                     options_per_question.append(len(instances))
                 
-                task_data["options_per_question"] = options_per_question
+                task_metadata["options_per_question"] = options_per_question
             
             # Get tensors for this task from chunks
             task_tensors_count = len(task.instances)
             remaining_count = task_tensors_count
             current_index = tensor_index
+            tensor_count = 0
             
-            # Reconstruct tensors for this task from chunks
-            eval_logger.info(f"Collecting tensors for task {task_name} from chunks")
-            all_tensors = []
+            # Reconstruct tensors for this task from chunks and save as individual files
+            eval_logger.info(f"Processing tensors for task {task_name} from chunks")
             
-            # Load tensors from chunks efficiently
+            # Load tensors from chunks efficiently and save as individual files
             for i in range(tensor_chunks_saved):
                 chunk_file = f"{temp_chunk_dir}/tensor_chunk_{i}.pt"
                 chunk_tensors = torch.load(chunk_file)
@@ -693,38 +698,54 @@ def evaluate(
                 end_idx = min(len(chunk_tensors), (current_index + remaining_count) - i * tensor_chunk_size)
                 
                 if start_idx < len(chunk_tensors) and end_idx > 0 and start_idx < end_idx:
-                    # Take relevant subset from this chunk
-                    relevant_tensors = chunk_tensors[start_idx:end_idx]
-                    all_tensors.extend(relevant_tensors)
-                    taken_count = len(relevant_tensors)
+                    # Process each tensor and save individually
+                    for j, tensor in enumerate(chunk_tensors[start_idx:end_idx]):
+                        # Save tensor to its own file
+                        tensor_file = task_tensor_dir / f"tensor_{tensor_count:06d}.pt"
+                        torch.save(tensor, tensor_file)
+                        tensor_count += 1
+                    
+                    taken_count = end_idx - start_idx
                     remaining_count -= taken_count
                     current_index += taken_count
+                
+                # Free memory
+                del chunk_tensors
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 # Stop if we've collected all tensors for this task
                 if remaining_count <= 0:
                     break
             
-            task_data["tensors"] = all_tensors
+            # Save metadata with task information
+            task_metadata["tensor_count"] = tensor_count
+            import json
+            with open(task_tensor_dir / "manifest.json", "w") as f:
+                json.dump(task_metadata, f, indent=2)
             
-            # Save this task's data separately
-            task_file = f"{output_dir}/{task_name}.pt"
-            torch.save(task_data, task_file)
-            task_files.append({"task_name": task_name, "file": task_file})
+            # Add task to task_files for the main manifest
+            task_files.append({
+                "task_name": task_name,
+                "is_tensor_dir": True,
+                "dir_path": str(task_tensor_dir),
+                "tensor_count": tensor_count
+            })
             
-            # Free memory
-            del task_data["tensors"]
-            del all_tensors
             tensor_index += task_tensors_count
             
             # Log progress
-            eval_logger.info(f"Saved tensors for task {task_name} to {task_file}")
+            eval_logger.info(f"Saved {tensor_count} tensors for task {task_name} to {task_tensor_dir}")
         
         # Save a manifest file with paths to all task files
         manifest = {
             "model": model_name,
             "task_files": task_files
         }
-        torch.save(manifest, f"{output_dir}/manifest.pt")
+        with open(Path(output_dir) / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
         
         # Clean up temp chunk directory
         import shutil
@@ -762,6 +783,22 @@ def evaluate(
                 world_size=WORLD_SIZE,
                 samples=indices,
             )
+            
+            # For large tasks like hellaswag, use JSONL streaming instead of in-memory storage
+            is_large_task = len(task.instances) > 10000
+            
+            if is_large_task and log_samples:
+                import json
+                from pathlib import Path
+                
+                # Create output directory for results
+                output_dir = os.environ.get("TASK_OUTPUT_DIR", "task_results")
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                
+                # Open file for this task
+                task_out_path = Path(output_dir) / f"{task_output.task_name}.jsonl"
+                task_out_file = task_out_path.open("w")
+                eval_logger.info(f"Streaming results for large task {task_output.task_name} to {task_out_path}")
             
             # For large tasks like hellaswag, process in smaller batches
             doc_batch_size = 500  # Process 500 documents at a time
@@ -817,7 +854,16 @@ def evaluate(
                             "target_hash": hash_string(str(target)),
                         }
                         example.update(metrics)
-                        task_output.logged_samples.append(example)
+                        
+                        # For large tasks, stream to file instead of storing in memory
+                        if is_large_task:
+                            # Write directly to file
+                            task_out_file.write(json.dumps(example, default=handle_non_serializable) + "\n")
+                            task_out_file.flush()
+                        else:
+                            # For smaller tasks, keep the original behavior
+                            task_output.logged_samples.append(example)
+                    
                     for metric, value in metrics.items():
                         task_output.sample_metrics[(metric, filter_key)].append(value)
                 
@@ -826,24 +872,32 @@ def evaluate(
                     torch.cuda.empty_cache()
                 import gc
                 gc.collect()
+            
+            # Close the file if we were streaming
+            if is_large_task and log_samples:
+                task_out_file.close()
+                eval_logger.info(f"Saved task results to {task_out_path}")
 
     if WORLD_SIZE > 1:
         # if multigpu, then gather data across all ranks to rank 0
         # first gather logged samples across all ranks
         for task_output in eval_tasks:
             if log_samples:
-                # for task_name, task_samples in list(samples.items()):
-                full_samples = [None] * WORLD_SIZE if RANK == 0 else None
-                torch.distributed.gather_object(
-                    obj=task_output.logged_samples,
-                    object_gather_list=full_samples,
-                    dst=0,
-                )
-
-                if RANK == 0:
-                    task_output.logged_samples = list(
-                        itertools.chain.from_iterable(full_samples)
+                # Skip gathering for large tasks - they're already streamed to disk
+                is_large_task = len(task_output.task.instances) > 10000
+                if not is_large_task:
+                    # for task_name, task_samples in list(samples.items()):
+                    full_samples = [None] * WORLD_SIZE if RANK == 0 else None
+                    torch.distributed.gather_object(
+                        obj=task_output.logged_samples,
+                        object_gather_list=full_samples,
+                        dst=0,
                     )
+
+                    if RANK == 0:
+                        task_output.logged_samples = list(
+                            itertools.chain.from_iterable(full_samples)
+                        )
 
             # then collect metrics across all ranks
             for metrics in task_output.sample_metrics:
