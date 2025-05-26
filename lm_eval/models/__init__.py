@@ -7,6 +7,7 @@ from . import (
     hf_steered,
     hf_vlms,
     huggingface,
+    huggingface_kl,
     ibm_watsonx_ai,
     mamba_lm,
     nemo_lm,
