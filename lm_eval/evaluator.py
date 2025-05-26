@@ -3,12 +3,13 @@ import json
 import logging
 import random
 import time
+import re
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import numpy as np
 import torch
-import os
+from pathlib import Path
 
 import lm_eval.api.metrics
 import lm_eval.api.registry
@@ -78,7 +79,6 @@ def simple_evaluate(
     fewshot_random_seed: int = 1234,
     confirm_run_unsafe_code: bool = False,
     metadata: Optional[dict] = None,
-    output_path: Optional[str] = None,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -143,9 +143,6 @@ def simple_evaluate(
         Random seed for fewshot sampler random generator. If set to None, the seed of generator will be set to None.
     :param metadata: dict
         Additional metadata to be added to the task manager. Will get passed to the download function of the task.
-    :param output_path: str or None
-        Path to store output files like logits. If None, default locations will be used.
-
     return
         Dictionary of results
     """
@@ -339,24 +336,57 @@ def simple_evaluate(
             else None,
             fewshot_as_multiturn=fewshot_as_multiturn,
         )
-
-    results = evaluate(
-        lm=lm,
-        task_dict=task_dict,
-        limit=limit,
-        samples=samples,
-        cache_requests=cache_requests,
-        rewrite_requests_cache=rewrite_requests_cache,
-        bootstrap_iters=bootstrap_iters,
-        write_out=write_out,
-        log_samples=True if predict_only else log_samples,
-        system_instruction=system_instruction,
-        apply_chat_template=apply_chat_template,
-        fewshot_as_multiturn=fewshot_as_multiturn,
-        verbosity=verbosity,
-        confirm_run_unsafe_code=confirm_run_unsafe_code,
-        output_path=output_path,
-    )
+    if not isinstance(lm, lm_eval.models.huggingface_kl.HFLM_KL):
+        results = evaluate(
+            lm=lm,
+            task_dict=task_dict,
+            limit=limit,
+            samples=samples,
+            cache_requests=cache_requests,
+            rewrite_requests_cache=rewrite_requests_cache,
+            bootstrap_iters=bootstrap_iters,
+            write_out=write_out,
+            log_samples=True if predict_only else log_samples,
+            system_instruction=system_instruction,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            verbosity=verbosity,
+            confirm_run_unsafe_code=confirm_run_unsafe_code,
+        ) 
+    else:
+        # Handle yielding for HFLM_KL models (we already know it's HFLM_KL from the if condition above)
+        generator = yield_evaluate(
+            lm=lm,
+            task_dict=task_dict,
+            limit=limit,
+            samples=samples,
+            cache_requests=cache_requests,
+            rewrite_requests_cache=rewrite_requests_cache,
+            bootstrap_iters=bootstrap_iters,
+            write_out=write_out,
+            log_samples=True if predict_only else log_samples,
+            system_instruction=system_instruction,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            verbosity=verbosity,
+            confirm_run_unsafe_code=confirm_run_unsafe_code,
+        )
+        
+        # Consume the generator to get logits (and let the evaluation complete)
+        logits_yielded = []
+        try:
+            for logits in generator:
+                logits_yielded.append(logits)
+                # Could optionally yield these logits to the caller if needed
+                # yield logits  # Uncomment if parent function needs logits
+        except StopIteration as e:
+            # Get the returned results from the generator
+            results = e.value
+        else:
+            # If no StopIteration was raised, the generator completed normally
+            # In Python 3.7+, we need to handle this case
+            results = None
+        
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
 
@@ -374,7 +404,7 @@ def simple_evaluate(
             "model_args": model_args,
         }
         # add more detailed model info if available
-        if isinstance(lm, lm_eval.models.huggingface.HFLM):
+        if isinstance(lm, lm_eval.models.huggingface_kl.HFLM_KL):
             results["config"].update(lm.get_model_info())
         # add info about execution
         results["config"].update(
@@ -419,8 +449,6 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
-    question_suffix: Optional[str] = None,
-    output_path: Optional[str] = None,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -455,8 +483,364 @@ def evaluate(
         Verbosity level for logging
     :param confirm_run_unsafe_code: bool
         Whether to confirm running tasks marked as unsafe.
-    :param output_path: str or None
-        Path to store output files like logits. If None, default locations will be used.
+    :return
+        Dictionary of results
+    """
+
+    if limit is not None and samples is not None:
+        raise ValueError(
+            "Either 'limit' or 'samples' must be None, but both are not None."
+        )
+    if samples is not None:
+        eval_logger.info(f"Evaluating examples for tasks {list(samples.keys())}")
+    if apply_chat_template:
+        eval_logger.warning(
+            "Chat template formatting change affects loglikelihood and multiple-choice tasks. See docs/chat-template-readme.md for details."
+        )
+    # tracks all Instances/requests a model must generate output on.
+    requests = defaultdict(list)
+    # stores the amount to pad out reqs per req. type so that
+    # number of fwd passes per distributed rank is equal
+    padding_requests = defaultdict(int)
+
+    # get lists of group hierarchy and each type of request
+    eval_tasks = get_task_list(task_dict)
+    if not log_samples:
+        if not all(
+            "bypass" not in getattr(task_output.task, "_metric_fn_list", {}).keys()
+            for task_output in eval_tasks
+        ):
+            raise ValueError("log_samples must be True for 'bypass' metric-only tasks")
+
+    # validation checks:
+    # 1.are we running multimodal task <-> non-multimodal model class, or vice-versa.
+    # 2.are we running code that is marked as unsafe.
+    incompatible_tasks = []
+    for task_output in eval_tasks:
+        task: Task = task_output.task
+
+        if getattr(task, "MULTIMODAL", False) and not getattr(lm, "MULTIMODAL", False):
+            incompatible_tasks.append(task_output.task_name)
+        elif getattr(task, "UNSAFE_CODE", False) and not confirm_run_unsafe_code:
+            raise ValueError(
+                f"Attempted to run task: {task_output.task_name} which is marked as unsafe. Set confirm_run_unsafe_code=True to run this task."
+            )
+    if len(incompatible_tasks) > 0:
+        if not getattr(lm, "MULTIMODAL", False):
+            raise ValueError(
+                f"Attempted to run tasks: {incompatible_tasks} which require multimodal input, but the selected model type does not currently implement this. Multimodal support is currently restricted to the ['hf-multimodal', 'vllm-vlm'] model type."
+            )
+        else:
+            raise ValueError(
+                f"Attempted to run tasks: {incompatible_tasks} which are text-only, but used a model type which only currently supports multimodal tasks."
+            )
+    # end validation check
+
+    # Cache the limit arg.
+    limit_arg = limit
+    limits = []
+    for task_output in eval_tasks:
+        task: Task = task_output.task
+
+        limit = get_sample_size(task, limit_arg)
+        limits.append(limit)
+        task.build_all_requests(
+            limit=limit,
+            samples=samples.get(task_output.task_name, None)
+            if samples is not None
+            else samples,
+            rank=lm.rank,
+            world_size=lm.world_size,
+            cache_requests=cache_requests,
+            rewrite_requests_cache=rewrite_requests_cache,
+            system_instruction=system_instruction,
+            apply_chat_template=bool(apply_chat_template),
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            chat_template=getattr(lm, "apply_chat_template")
+            if apply_chat_template
+            else None,
+            tokenizer_name=getattr(lm, "tokenizer_name", "")
+            if apply_chat_template
+            else "",
+        )
+        eval_logger.debug(
+            f"Task: {task_output.task_name}; number of requests on this rank: {len(task.instances)}"
+        )
+        if write_out:
+            print_writeout(task)
+        # aggregate Instances by LM method requested to get output.
+        for instance in task.instances:
+            reqtype = instance.request_type
+            requests[reqtype].append(instance)
+
+        if lm.world_size > 1:
+            instances_rnk = torch.tensor(len(task._instances), device=lm.device)
+            gathered_item = (
+                lm.accelerator.gather(instances_rnk).cpu().detach().numpy().tolist()
+            )
+            # "multiple_choice" task types dispatch (several) "loglikelihood" request types
+            reqtype = (
+                "loglikelihood"
+                if task.OUTPUT_TYPE == "multiple_choice"
+                else task.OUTPUT_TYPE
+            )
+            # compute number of pseudo-batches to pad with (FSDP/DDP require even batches among ranks)
+            numpad = max(gathered_item) - gathered_item[lm.rank]
+            # todo: may not account for padding in cases like SquadV2 which has multiple req types
+            padding_requests[reqtype] += numpad
+
+    ### Run LM on inputs, get all outputs ###
+    # execute each type of request
+    for reqtype, reqs in requests.items():
+        eval_logger.info(f"Running {reqtype} requests")
+        # create `K` copies of each request `req` based off `K = req.repeats`
+        cloned_reqs = []
+        for req in reqs:
+            cloned_reqs.extend([req] * req.repeats)
+
+        if (lm.world_size > 1) and (padding_requests[reqtype] > 0):
+            for _ in range(padding_requests[reqtype]):
+                cloned_reqs.extend([req] * req.repeats)
+
+        # run requests through model
+        resps = getattr(lm, reqtype)(cloned_reqs)
+
+        # put responses from model into a list of length K for each request.
+        for x, req in zip(resps, cloned_reqs):
+            req.resps.append(x)
+
+        if lm.world_size > 1:
+            lm.accelerator.wait_for_everyone()
+
+    RANK = lm.rank
+    WORLD_SIZE = lm.world_size
+    ### Postprocess outputs ###
+    # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
+    for task_output, limit in zip(eval_tasks, limits):
+        task = task_output.task
+        task.apply_filters()
+
+        ### Collect values of metrics on all datapoints ###
+        # # unpack results and sort back in order and return control to Task
+        # TODO: make it possible to use a different metric per filter
+        # Pre-process task.instances to group by doc_id
+        instances_by_doc_id = defaultdict(list)
+        for instance in task.instances:
+            instances_by_doc_id[instance.doc_id].append(instance)
+        # Sort instances within each group
+        for instances in instances_by_doc_id.values():
+            instances.sort(key=lambda x: x.idx)
+        # iterate over different filters used
+        for filter_key in task.instances[0].filtered_resps.keys():
+            indices = (
+                samples.get(task_output.task_name, None)
+                if samples is not None
+                else None
+            )
+            doc_iterator = task.doc_iterator(
+                rank=RANK,
+                limit=limit,
+                world_size=WORLD_SIZE,
+                samples=indices,
+            )
+            for doc_id, doc in doc_iterator:
+                if indices:
+                    doc_id_true = indices[doc_id]
+                else:
+                    doc_id_true = doc_id
+                requests = instances_by_doc_id[doc_id]
+                metrics = task.process_results(
+                    doc, [req.filtered_resps[filter_key] for req in requests]
+                )
+                if log_samples:
+                    target = task.doc_to_target(doc)
+                    example = {
+                        "doc_id": doc_id_true,
+                        "doc": doc,
+                        "target": target,
+                        "arguments": [req.args for req in requests],
+                        "resps": [req.resps for req in requests],
+                        "filtered_resps": [
+                            req.filtered_resps[filter_key] for req in requests
+                        ],
+                        "filter": filter_key,
+                        "metrics": list(metrics.keys()),
+                        "doc_hash": hash_string(
+                            json.dumps(
+                                requests[0].doc,
+                                indent=2,
+                                default=handle_non_serializable,
+                                ensure_ascii=False,
+                            )
+                        ),
+                        "prompt_hash": hash_string(requests[0].arguments[0]),
+                        "target_hash": hash_string(str(target)),
+                    }
+                    example.update(metrics)
+                    task_output.logged_samples.append(example)
+                for metric, value in metrics.items():
+                    task_output.sample_metrics[(metric, filter_key)].append(value)
+
+    if WORLD_SIZE > 1:
+        # if multigpu, then gather data across all ranks to rank 0
+        # first gather logged samples across all ranks
+        for task_output in eval_tasks:
+            if log_samples:
+                # for task_name, task_samples in list(samples.items()):
+                full_samples = [None] * WORLD_SIZE if RANK == 0 else None
+                torch.distributed.gather_object(
+                    obj=task_output.logged_samples,
+                    object_gather_list=full_samples,
+                    dst=0,
+                )
+
+                if RANK == 0:
+                    task_output.logged_samples = list(
+                        itertools.chain.from_iterable(full_samples)
+                    )
+
+            # then collect metrics across all ranks
+            for metrics in task_output.sample_metrics:
+                metric_list = [None] * WORLD_SIZE if RANK == 0 else None
+                torch.distributed.gather_object(
+                    obj=task_output.sample_metrics[metrics],
+                    object_gather_list=metric_list,
+                    dst=0,
+                )
+                if RANK == 0:
+                    task_output.sample_metrics[metrics] = list(
+                        itertools.chain.from_iterable(metric_list)
+                    )
+
+    if RANK == 0:
+        ### Aggregate results over all datapoints ###
+        # aggregate results ; run bootstrap CIs
+        for task_output in eval_tasks:
+            task_output.calculate_aggregate_metric(bootstrap_iters=bootstrap_iters)
+        (
+            results,
+            samples,
+            configs,
+            versions,
+            num_fewshot,
+            higher_is_better,
+        ) = consolidate_results(eval_tasks)
+
+        ### Calculate group metrics ###
+        if bool(results):
+            results, versions, show_group_table, *_ = consolidate_group_results(
+                results, versions, task_dict
+            )
+
+        results_agg, group_agg = prepare_print_tasks(task_dict, results)
+        subtask_list = get_subtask_list(task_dict)
+
+        # collect all higher_is_better values for metrics
+        # in the group's subtasks.
+        # TODO: clean this up ; unify with the below metric_list loop?
+        _higher_is_better = {}
+        for group, task_list in subtask_list.items():
+            if (
+                len(task_list) != 0
+            ):  # subtask list will list "task_name": [] for solo tasks
+                for task in task_list:
+                    for m, h in higher_is_better[task].items():
+                        if m not in _higher_is_better.keys():
+                            _higher_is_better[m] = h
+
+                        if (
+                            m in _higher_is_better
+                            and _higher_is_better[m] is not None
+                            and _higher_is_better[m] != h
+                        ):
+                            eval_logger.warning(
+                                f"Higher_is_better values for metric {m} in group {group} are not consistent. Defaulting to None."
+                            )
+                            _higher_is_better[m] = None
+                higher_is_better[group] = _higher_is_better
+
+        results_dict = {
+            "results": dict(results_agg.items()),
+            **(
+                {"groups": dict(group_agg.items())}
+                if (bool(group_agg) & show_group_table)
+                else {}
+            ),
+            "group_subtasks": dict(reversed(subtask_list.items())),
+            "configs": dict(sorted(configs.items())),
+            "versions": dict(sorted(versions.items())),
+            "n-shot": dict(sorted(num_fewshot.items())),
+            "higher_is_better": dict(sorted(higher_is_better.items())),
+            "n-samples": {
+                task_output.task_name: {
+                    "original": len(task_output.task.eval_docs),
+                    "effective": min(
+                        limit if limit else len(task_output.task.eval_docs),
+                        len(task_output.task.eval_docs),
+                    ),
+                }
+                for task_output, limit in zip(eval_tasks, limits)
+            },
+        }
+        if log_samples:
+            results_dict["samples"] = dict(samples)
+
+        return results_dict
+
+    else:
+        return None
+
+@positional_deprecated
+def yield_evaluate(
+    lm: "LM",
+    task_dict,
+    limit: Optional[int] = None,
+    samples: Optional[dict] = None,
+    cache_requests: bool = False,
+    rewrite_requests_cache: bool = False,
+    bootstrap_iters: Optional[int] = 100000,
+    write_out: bool = False,
+    log_samples: bool = True,
+    system_instruction: Optional[str] = None,
+    apply_chat_template: Union[bool, str] = False,
+    fewshot_as_multiturn: bool = False,
+    verbosity: str = "INFO",
+    confirm_run_unsafe_code: bool = False,
+    question_suffix: Optional[str] = None,
+):
+    """Instantiate and evaluate a model on a list of tasks.
+
+    :param lm: obj
+        Language Model
+    :param task_dict: dict[str, Task]
+        Dictionary of tasks. Tasks will be taken to have name type(task).config.task .
+    :param limit: int, optional
+        Limit the number of examples per task (only use this for testing)
+    :param samples: dictionary, optional
+        Dictionary indicating which examples should be tested in each task, e.g., {"mmlu_astronomy":[0,3,6],"mmlu_anatomy":[1,4,7,10]}.
+    :param cache_requests: bool, optional
+        Speed up evaluation by caching the building of dataset requests.
+    :param rewrite_requests_cache: bool, optional
+        Rewrites all the request cache if set to `True`.
+    :param bootstrap_iters:
+        Number of iterations for bootstrap statistics, used when calculating stderr. Set to 0 for skipping all stderr calculations.
+    :param write_out: bool
+        If True, write out an example document and model input for checking task integrity
+    :param log_samples: bool
+        If True, write out all model outputs and documents for per-sample measurement and post-hoc analysis
+    :param system_instruction: str
+        System instruction to be applied to the prompt
+    :param apply_chat_template: Union[bool, str]
+        Specifies whether to apply a chat template to the prompt.
+        - If set to True, the default chat template is applied.
+        - If set to a string, applies the specified chat template by name.
+        Defaults to False (no chat template applied).
+    :param fewshot_as_multiturn: bool
+        Whether to provide the fewshot examples as a multiturn conversation or a single user turn.
+    :param verbosity: str
+        Verbosity level for logging
+    :param confirm_run_unsafe_code: bool
+        Whether to confirm running tasks marked as unsafe.
     :return
         Dictionary of results
     """
@@ -566,35 +950,6 @@ def evaluate(
 
     ### Run LM on inputs, get all outputs ###
     # execute each type of request
-    tensor_list = []
-    tensor_chunk_size = 500  # Save tensors in chunks of 1000 to prevent excessive memory usage
-    tensor_chunks_saved = 0
-    
-    # Prepare for chunked tensor saving
-    if type(lm) == lm_eval.models.huggingface.HFLM and log_samples:
-        # Process and save tensors by task to avoid memory issues
-        model_name = lm._model.config._name_or_path.split('/')[-1]
-        
-        # Extract task name from the first task for folder naming
-        first_task_name = eval_tasks[0].task_name if eval_tasks else "unknown_task"
-        # Get the base task name without subtask (e.g., "mmlu" from "mmlu_astronomy")
-        base_task_name = first_task_name.split('_')[0] if '_' in first_task_name else first_task_name
-        
-        # Check if output_path is provided from the parent function
-        if output_path:
-            # Use the provided output path with {task_name}_logits subfolder
-            output_dir = os.path.join(output_path, f"{base_task_name}_logits")
-        else:
-            # Fallback to the old behavior if no output path is provided
-            output_dir = f"{model_name}_tensor_chunks"
-        
-        # Create directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create a temporary chunk directory
-        temp_chunk_dir = os.path.join(output_dir, "temp_chunks")
-        os.makedirs(temp_chunk_dir, exist_ok=True)
-    
     for reqtype, reqs in requests.items():
         eval_logger.info(f"Running {reqtype} requests")
         # create `K` copies of each request `req` based off `K = req.repeats`
@@ -607,151 +962,37 @@ def evaluate(
                 cloned_reqs.extend([req] * req.repeats)
 
         # run requests through model
-        resps = getattr(lm, reqtype)(cloned_reqs)
+        lm_method = getattr(lm, reqtype)
+        
+        # Handle yielding for loglikelihood requests (which yield logits)
+        print(reqtype)
+        print(isinstance(lm, lm_eval.models.huggingface_kl.HFLM_KL))
+        if reqtype == "loglikelihood" and isinstance(lm, lm_eval.models.huggingface_kl.HFLM_KL):
+            # For loglikelihood, the method yields logits and returns results
+            try:
+                generator = lm_method(cloned_reqs)
+                # Consume the generator to get logits and let the model complete
+                logits_yielded = []
+                for logits in generator:
+                    logits_yielded.append(logits)
+                    yield logits  # Yield logits as they come from the model
+                
+                # After consuming the generator, call again to get the final results
+                resps = lm_method(cloned_reqs)
+            except TypeError:
+                # If the method doesn't yield (fallback case), just get results directly  
+                resps = lm_method(cloned_reqs)
+        else:
+            # For other request types, just get results normally
+            resps = lm_method(cloned_reqs)
 
         # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):
-            if type(lm) == lm_eval.models.huggingface.HFLM:
-                req.resps.append(x[:2])
-                tensor_list.append(x[2])
-                # Save tensors in chunks to prevent memory buildup
-                if log_samples and len(tensor_list) >= tensor_chunk_size:
-                    chunk_file = f"{temp_chunk_dir}/tensor_chunk_{tensor_chunks_saved}.pt"
-                    torch.save(tensor_list, chunk_file)
-                    tensor_chunks_saved += 1
-                    # Clear the list to free memory
-                    tensor_list = []
-                    # Explicitly call garbage collection
-                    import gc
-                    gc.collect()
-                    # Free CUDA memory if possible
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            else:
-                req.resps.append(x)
+            req.resps.append(x)
+        
         if lm.world_size > 1:
             lm.accelerator.wait_for_everyone()
-            
-    if type(lm) == lm_eval.models.huggingface.HFLM and log_samples:
-        # Save any remaining tensors
-        if tensor_list:
-            chunk_file = f"{temp_chunk_dir}/tensor_chunk_{tensor_chunks_saved}.pt"
-            torch.save(tensor_list, chunk_file)
-            tensor_chunks_saved += 1
-            # Clear the list to free memory
-            tensor_list = []
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        # Now process and organize saved chunks by task
-        tensor_index = 0
-        task_files = []
-        
-        for task_output, limit in zip(eval_tasks, limits):
-            task = task_output.task
-            task_name = task_output.task_name
-            
-            # Determine task type
-            task_type = task.OUTPUT_TYPE
-            
-            # Create task-specific tensor directory using our new approach
-            from pathlib import Path
-            task_tensor_dir = Path(output_dir) / f"{task_name}_tensors"
-            task_tensor_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Collect metadata for the task
-            task_metadata = {
-                "task_name": task_name,
-                "task_type": task_type,
-            }
-            
-            # For MCQ tasks, track options per question
-            if task_type == "multiple_choice":
-                instances_by_doc_id = defaultdict(list)
-                for instance in task.instances:
-                    instances_by_doc_id[instance.doc_id].append(instance)
-                
-                options_per_question = []
-                for doc_id, instances in instances_by_doc_id.items():
-                    options_per_question.append(len(instances))
-                
-                task_metadata["options_per_question"] = options_per_question
-            
-            # Get tensors for this task from chunks
-            task_tensors_count = len(task.instances)
-            remaining_count = task_tensors_count
-            current_index = tensor_index
-            tensor_count = 0
-            
-            # Reconstruct tensors for this task from chunks and save as individual files
-            eval_logger.info(f"Processing tensors for task {task_name} from chunks")
-            
-            # Load tensors from chunks efficiently and save as individual files
-            for i in range(tensor_chunks_saved):
-                chunk_file = f"{temp_chunk_dir}/tensor_chunk_{i}.pt"
-                chunk_tensors = torch.load(chunk_file)
-                
-                # Get tensors that overlap with the current task range
-                start_idx = max(0, current_index - i * tensor_chunk_size)
-                end_idx = min(len(chunk_tensors), (current_index + remaining_count) - i * tensor_chunk_size)
-                
-                if start_idx < len(chunk_tensors) and end_idx > 0 and start_idx < end_idx:
-                    # Process each tensor and save individually
-                    for j, tensor in enumerate(chunk_tensors[start_idx:end_idx]):
-                        # Save tensor to its own file
-                        tensor_file = task_tensor_dir / f"tensor_{tensor_count:06d}.pt"
-                        torch.save(tensor, tensor_file)
-                        tensor_count += 1
-                    
-                    taken_count = end_idx - start_idx
-                    remaining_count -= taken_count
-                    current_index += taken_count
-                
-                # Free memory
-                del chunk_tensors
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                # Stop if we've collected all tensors for this task
-                if remaining_count <= 0:
-                    break
-            
-            # Save metadata with task information
-            task_metadata["tensor_count"] = tensor_count
-            import json
-            with open(task_tensor_dir / "manifest.json", "w") as f:
-                json.dump(task_metadata, f, indent=2)
-            
-            # Add task to task_files for the main manifest
-            task_files.append({
-                "task_name": task_name,
-                "is_tensor_dir": True,
-                "dir_path": str(task_tensor_dir),
-                "tensor_count": tensor_count
-            })
-            
-            tensor_index += task_tensors_count
-            
-            # Log progress
-            eval_logger.info(f"Saved {tensor_count} tensors for task {task_name} to {task_tensor_dir}")
-        
-        # Save a manifest file with paths to all task files
-        manifest = {
-            "model": model_name,
-            "task_files": task_files
-        }
-        with open(Path(output_dir) / "manifest.json", "w") as f:
-            json.dump(manifest, f, indent=2)
-        
-        # Clean up temp chunk directory
-        import shutil
-        shutil.rmtree(temp_chunk_dir, ignore_errors=True)
-        
-        eval_logger.info(f"Saved all tensor data to {output_dir}/")
+
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
     ### Postprocess outputs ###
@@ -784,23 +1025,8 @@ def evaluate(
                 samples=indices,
             )
             
-            # For large tasks like hellaswag, use JSONL streaming instead of in-memory storage
-            is_large_task = len(task.instances) > 10000
-            
-            if is_large_task and log_samples:
-                import json
-                from pathlib import Path
-                
-                # Create output directory for results
-                output_dir = os.environ.get("TASK_OUTPUT_DIR", "task_results")
-                Path(output_dir).mkdir(parents=True, exist_ok=True)
-                
-                # Open file for this task
-                task_out_path = Path(output_dir) / f"{task_output.task_name}.jsonl"
-                task_out_file = task_out_path.open("w")
-                eval_logger.info(f"Streaming results for large task {task_output.task_name} to {task_out_path}")
-            
-            # For large tasks like hellaswag, process in smaller batches
+
+            # Process in batches for better memory efficiency
             doc_batch_size = 500  # Process 500 documents at a time
             doc_batches = []
             current_batch = []
@@ -854,15 +1080,8 @@ def evaluate(
                             "target_hash": hash_string(str(target)),
                         }
                         example.update(metrics)
-                        
-                        # For large tasks, stream to file instead of storing in memory
-                        if is_large_task:
-                            # Write directly to file
-                            task_out_file.write(json.dumps(example, default=handle_non_serializable) + "\n")
-                            task_out_file.flush()
-                        else:
-                            # For smaller tasks, keep the original behavior
-                            task_output.logged_samples.append(example)
+
+                        task_output.logged_samples.append(example)
                     
                     for metric, value in metrics.items():
                         task_output.sample_metrics[(metric, filter_key)].append(value)
@@ -873,20 +1092,15 @@ def evaluate(
                 import gc
                 gc.collect()
             
-            # Close the file if we were streaming
-            if is_large_task and log_samples:
-                task_out_file.close()
-                eval_logger.info(f"Saved task results to {task_out_path}")
 
     if WORLD_SIZE > 1:
         # if multigpu, then gather data across all ranks to rank 0
         # first gather logged samples across all ranks
         for task_output in eval_tasks:
             if log_samples:
-                # Skip gathering for large tasks - they're already streamed to disk
-                is_large_task = len(task_output.task.instances) > 10000
-                if not is_large_task:
-                    # for task_name, task_samples in list(samples.items()):
+                # Skip gathering for tasks where we've streamed results to disk
+                use_streaming = len(task_output.task.instances) > 0
+                if not use_streaming:
                     full_samples = [None] * WORLD_SIZE if RANK == 0 else None
                     torch.distributed.gather_object(
                         obj=task_output.logged_samples,

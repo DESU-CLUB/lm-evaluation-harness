@@ -14,10 +14,28 @@ import multiprocessing
 from datetime import datetime
 from lm_eval.loggers import EvaluationTracker
 
+### KL DIVERGENCE EVALUATION CONFIGURATION ###
+# 
+# This script supports optional KL divergence evaluation between model pairs.
+# 
+# When KL_DIVERGENCE_ENABLED = True:
+#   - Uses 'hf_kl' model instead of 'hf' for non-vLLM models
+#   - Calculates KL divergence between logits of base and quantized models
+#   - Saves KL divergence results alongside flip analysis
+# 
+# When KL_DIVERGENCE_ENABLED = False (default):
+#   - Uses standard 'hf' model for evaluation
+#   - Skips KL divergence calculation (faster evaluation)
+#   - Only performs flip analysis between models
+#
+# Note: KL divergence calculation requires models to yield logits, which is only
+# supported by the 'hf_kl' model type. vLLM models will always skip KL calculation.
+###
+
 ### Run simple test on hellaswag
 model_groups = [
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-    "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-bnb-4bit"),
+    # ("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    # "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-bnb-4bit"),
     ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
      "RedHatAI/DeepSeek-R1-Distill-Qwen-7B-quantized.w8a8",
      "RedHatAI/DeepSeek-R1-Distill-Qwen-7B-quantized.w4a16"),
@@ -41,7 +59,7 @@ hellaswag_config = {
 mmlu_config = {
     "task_name": "mmlu",
     "log_samples": True,
-    "batch_size": 16,
+    "batch_size": 8,
 }
 
 arc_c_config = {
@@ -218,24 +236,386 @@ def is_vllm_quantized_model(model_name):
     # Look for patterns like w4a16, w8a8, etc.
     return bool(re.search(r'w\d+a\d+', model_name.lower()))
 
-def run_task_evaluations_and_flips(config, model_groups, group_dirs):
-    """Run evaluations for a specific task config and calculate flips between model pairs"""
+def get_task_metadata(task_name, model_dir=None):
+    """
+    Get accurate task metadata including type and options per question.
+    
+    Args:
+        task_name: Name of the task
+        model_dir: Optional model directory to check for existing samples
+        
+    Returns:
+        Dict with task_type, default_options, and options_per_question if available
+    """
+    # Known task patterns
+    task_patterns = {
+        'arc_challenge': {'type': 'multiple_choice', 'options': 4},
+        'mmlu': {'type': 'multiple_choice', 'options': 4},
+        'hellaswag': {'type': 'multiple_choice', 'options': 4}, 
+        'winogrande': {'type': 'multiple_choice', 'options': 2},
+        'truthfulqa': {'type': 'multiple_choice', 'options': 4},  # Can vary
+        'gsm8k': {'type': 'generative', 'options': None},
+    }
+    
+    # Default metadata
+    metadata = {
+        'task_name': task_name,
+        'task_type': 'generative',
+        'default_options': 4,
+        'options_per_question': None
+    }
+    
+    # Check known patterns
+    for pattern, info in task_patterns.items():
+        if pattern in task_name.lower():
+            metadata['task_type'] = info['type']
+            metadata['default_options'] = info['options']
+            print(f"[INFO] Detected task pattern: {pattern} -> {info}")
+            break
+    
+    # Try to get more accurate info from existing samples (if available)
+    if model_dir and metadata['task_type'] == 'multiple_choice':
+        try:
+            # Look for existing JSONL sample files
+            samples_dir = os.path.join(model_dir, "samples")
+            if os.path.exists(samples_dir):
+                import glob
+                jsonl_files = glob.glob(os.path.join(samples_dir, f"samples_{task_name}_*.jsonl"))
+                
+                if jsonl_files:
+                    # Read first few samples to count options
+                    options_counts = []
+                    with open(jsonl_files[0], 'r') as f:
+                        for i, line in enumerate(f):
+                            if i >= 10:  # Check first 10 questions
+                                break
+                            try:
+                                sample = json.loads(line)
+                                if 'choices' in sample:
+                                    options_counts.append(len(sample['choices']))
+                                elif 'options' in sample:
+                                    options_counts.append(len(sample['options']))
+                            except:
+                                continue
+                    
+                    if options_counts:
+                        # Check if all questions have same number of options
+                        if len(set(options_counts)) == 1:
+                            metadata['default_options'] = options_counts[0]
+                            print(f"[INFO] Verified from samples: {metadata['default_options']} options per question")
+                        else:
+                            metadata['options_per_question'] = options_counts
+                            print(f"[INFO] Variable options detected: {set(options_counts)}")
+                            
+        except Exception as e:
+            print(f"[WARN] Could not extract options from samples: {e}")
+    
+    return metadata
+
+def setup_streaming_kl_computation(base_model, new_model, task_name, group_dir, task_config=None):
+    """
+    Set up streaming KL computation between two models.
+    Returns queues and process for real-time KL calculation.
+    
+    Args:
+        base_model: Base model name
+        new_model: New model name  
+        task_name: Task name for logging
+        group_dir: Group directory for output
+        task_config: Task configuration dict containing task metadata
+    """
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    
+    # Create queues for logits communication
+    manager = mp.Manager()
+    base_logits_queue = manager.Queue(maxsize=200)
+    new_logits_queue = manager.Queue(maxsize=200)
+    
+    # Get enhanced task metadata
+    base_model_dir = os.path.join(group_dir, get_model_dir(base_model))
+    task_metadata = get_task_metadata(task_name, base_model_dir)
+    
+    print(f"[INFO] Task metadata for {task_name}: {task_metadata}")
+    
+    # Start KL computation process
+    executor = ProcessPoolExecutor(max_workers=1)
+    kl_future = executor.submit(
+        KLEval.compute_streaming_kl,
+        base_logits_queue,
+        new_logits_queue,
+        buffer_size=100,
+        task_metadata=task_metadata
+    )
+    
+    return {
+        'base_queue': base_logits_queue,
+        'new_queue': new_logits_queue,
+        'kl_future': kl_future,
+        'executor': executor
+    }
+
+def evaluate_model_with_streaming_logits(config, model_name, model_dir, logits_queue=None):
+    """
+    Evaluate a model and optionally stream logits to a queue for real-time KL computation.
+    """
+    # Configure model args based on model type
+    if is_vllm_quantized_model(model_name):
+        print(f"\nDetected quantized model requiring vLLM: {model_name}")
+        config_copy = config.copy()
+        config_copy["model"] = "vllm"
+        config_copy["model_args"] = f"pretrained={model_name},max_model_len=4096,gpu_memory_utilization=0.8,tensor_parallel_size=1"
+        config_copy["batch_size"] = "auto"
+        cleanup_vllm_processes()
+    else:
+        # Use hf_kl for streaming logits when KL divergence is needed
+        config_copy = config.copy()
+        if logits_queue is not None:
+            config_copy["model"] = "hf_kl"
+            print(f"[INFO] Using hf_kl model for logits streaming")
+        else:
+            config_copy["model"] = "hf_kl" if config.get("kl_divergence", False) else "hf"
+        config_copy["model_args"] = f"pretrained={model_name}"
+    
+    print(f"\nEvaluating model: {model_name} on {config_copy['task_name']}")
+    print(f"Using engine: {config_copy['model']}")
+    clear_memory()
+    
+    # Initialize the tracker
+    eval_tracker = EvaluationTracker(output_path=model_dir)
+    eval_tracker.general_config_tracker.model_name_sanitized = model_name
+    eval_tracker.date_id = datetime.now().isoformat().replace(":", "-")
+    
+    # For hf_kl models with logits streaming, we need to handle the generator properly
+    if logits_queue is not None and config_copy["model"] == "hf_kl":
+        print(f"[INFO] Streaming logits for real-time KL computation")
+        
+        # Create the model instance manually to get the generator
+        import lm_eval.api.registry
+        lm = lm_eval.api.registry.get_model(config_copy["model"]).create_from_arg_string(
+            config_copy["model_args"], {}
+        )
+        
+        # Get task dict for evaluation
+        from lm_eval.tasks import TaskManager, get_task_dict
+        task_manager = TaskManager()
+        task_dict = get_task_dict([config_copy["task_name"]], task_manager)
+        
+        # Call yield_evaluate directly to get the generator
+        from lm_eval.evaluator import yield_evaluate
+        
+        generator = yield_evaluate(
+            lm=lm,
+            task_dict=task_dict,
+            limit=config_copy.get("limit", None),
+            samples=None,
+            cache_requests=False,
+            rewrite_requests_cache=False,
+            bootstrap_iters=config_copy.get("bootstrap_iters", 100000),
+            write_out=False,
+            log_samples=True,
+            system_instruction=None,
+            apply_chat_template=False,
+            fewshot_as_multiturn=False,
+            verbosity="INFO",
+            confirm_run_unsafe_code=False,
+        )
+        
+        # Consume the generator to capture yielded logits and get final results
+        logits_count = 0
+        try:
+            for logits in generator:
+                logits_queue.put(logits)
+                logits_count += 1
+                if logits_count % 100 == 0:
+                    print(f"[INFO] Streamed {logits_count} logits to queue")
+        except StopIteration as e:
+            # Get the returned results from the generator
+            results = e.value
+            print(f"[INFO] Finished streaming {logits_count} logits, evaluation complete")
+        else:
+            # Handle the case where generator completed without StopIteration
+            results = None
+            print(f"[WARN] Generator completed without StopIteration, results may be None")
+        
+        # Signal end of logits stream
+        logits_queue.put(None)
+        
+        if results is None:
+            print(f"[ERROR] No results returned from yield_evaluate")
+            return None
+            
+    else:
+        # Standard evaluation without logits streaming
+        results = lm_eval.simple_evaluate(
+            model=config_copy["model"],
+            model_args=config_copy["model_args"],
+            tasks=[config_copy["task_name"]],
+            num_fewshot=config_copy.get("num_fewshot", 0),
+            batch_size=config_copy.get("batch_size", None),
+            limit=config_copy.get("limit", None),
+            log_samples=True,
+        )
+    
+    # Save results as before
+    md = lm_eval.utils.make_table(results)
+    
+    # Extract and save samples
+    if "samples" in results:
+        samples = results.pop("samples")
+        samples_dir = os.path.join(model_dir, "samples")
+        os.makedirs(samples_dir, exist_ok=True)
+        
+        for task_name, task_samples in samples.items():
+            eval_tracker.save_results_samples(
+                task_name=task_name,
+                samples=task_samples
+            )
+            print(f"Samples for {task_name} saved via tracker to {model_dir}")
+    
+    # Save results files
+    task_name = config_copy["task_name"]
+    results_filename = os.path.join(model_dir, f"{task_name}_results.md")
+    with open(results_filename, "w") as f:
+        f.write(md)
+    
+    results_json_filename = os.path.join(model_dir, f"{task_name}_results.jsonl")
+    with open(results_json_filename, "w") as f:
+        json.dump(results["results"][task_name], f, indent=2)
+    
+    print(f"Results saved to {results_filename}")
+    
+    return results
+
+def run_task_evaluations_and_flips(config, model_groups, group_dirs, kl_divergence=False):
+    """Run evaluations for a specific task config and calculate flips between model pairs
+    
+    Args:
+        config: Task configuration dictionary
+        model_groups: List of model groups to evaluate
+        group_dirs: Directory mapping for model groups  
+        kl_divergence: If True, use hf_kl model and enable KL divergence calculation (default: False)
+    """
     task_name = config["task_name"]
     print(f"\n{'='*60}\nEvaluating task: {task_name}\n{'='*60}")
     
-    # Dictionary to store results for each model
+    if kl_divergence:
+        print(f"🧮 KL divergence evaluation ENABLED - using streaming approach")
+        return _run_evaluations_with_kl_streaming(config, model_groups, group_dirs)
+    else:
+        print(f"⚡ KL divergence evaluation DISABLED - using standard approach")
+        return _run_evaluations_standard(config, model_groups, group_dirs)
+
+def _run_evaluations_with_kl_streaming(config, model_groups, group_dirs):
+    """Run evaluations with KL divergence streaming enabled"""
+    task_name = config["task_name"]
     task_results = {}
-    # Dictionary to track which models use vllm (for KL divergence calculation)
+    vllm_models = {}
+    
+    # First pass: Run evaluations on all models with streaming KL for compatible pairs
+    for models in model_groups:
+        base_model = models[0]
+        group_dir = group_dirs[base_model]
+        group_results = {}
+        
+        # Check if we should set up streaming KL computation
+        streaming_kl_setup = None
+        if len(models) >= 2:
+            base_uses_vllm = is_vllm_quantized_model(base_model)
+            first_quant_uses_vllm = is_vllm_quantized_model(models[1])
+            
+            if not base_uses_vllm and not first_quant_uses_vllm:
+                print(f"\n🚀 Setting up real-time KL computation for {base_model} vs {models[1]}")
+                streaming_kl_setup = setup_streaming_kl_computation(
+                    base_model, models[1], task_name, group_dir, config
+                )
+            else:
+                print(f"⏩ Skipping real-time KL: vLLM detected (base: {base_uses_vllm}, quant: {first_quant_uses_vllm})")
+        
+        # Evaluate each model in sequence
+        for i, model_name in enumerate(models):
+            is_vllm_model = is_vllm_quantized_model(model_name)
+            vllm_models[model_name] = is_vllm_model
+            
+            model_dir = os.path.join(group_dir, get_model_dir(model_name))
+            os.makedirs(os.path.join(model_dir, "samples"), exist_ok=True)
+            
+            # Determine if this model should stream logits for KL computation
+            logits_queue = None
+            if streaming_kl_setup is not None:
+                if model_name == base_model:
+                    logits_queue = streaming_kl_setup['base_queue']
+                    print(f"📊 {model_name} will stream logits to base queue")
+                elif model_name == models[1]:  # First quantized model
+                    logits_queue = streaming_kl_setup['new_queue']
+                    print(f"📊 {model_name} will stream logits to new queue")
+            
+            # Evaluate the model (with or without logits streaming)
+            config_with_kl = config.copy()
+            config_with_kl["kl_divergence"] = True
+            
+            results = evaluate_model_with_streaming_logits(
+                config_with_kl, model_name, model_dir, logits_queue
+            )
+            
+            # Extract accuracy and store results
+            results_dict = results["results"][task_name]
+            accuracy = extract_accuracy_from_results(results_dict)
+            
+            group_results[model_name] = {
+                "accuracy": accuracy,
+                "results": results_dict
+            }
+        
+        # Collect streaming KL results if they were computed
+        streaming_kl_results = None
+        if streaming_kl_setup is not None:
+            try:
+                print(f"⏳ Waiting for streaming KL computation to complete...")
+                streaming_kl_results = streaming_kl_setup['kl_future'].result(timeout=60)
+                streaming_kl_setup['executor'].shutdown(wait=True)
+                
+                if streaming_kl_results:
+                    print(f"✅ Streaming KL computation completed: {streaming_kl_results.get('mean_kl', 'N/A')}")
+                    
+                    # Save streaming KL results
+                    comparison_dir = os.path.join(group_dir, "comparisons")
+                    os.makedirs(comparison_dir, exist_ok=True)
+                    
+                    kl_filename = os.path.join(
+                        comparison_dir, 
+                        f"{task_name}_{get_model_dir(base_model)}_vs_{get_model_dir(models[1])}_streaming_kl.json"
+                    )
+                    with open(kl_filename, "w") as f:
+                        json.dump(streaming_kl_results, f, indent=2)
+                    print(f"💾 Streaming KL results saved to {kl_filename}")
+                    
+            except Exception as e:
+                print(f"❌ Error collecting streaming KL results: {e}")
+                try:
+                    streaming_kl_setup['executor'].shutdown(wait=False)
+                except:
+                    pass
+        
+        # Store the group results
+        task_results[base_model] = group_results
+    
+    # Continue with flip analysis (same as standard approach)
+    _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=True)
+
+def _run_evaluations_standard(config, model_groups, group_dirs):
+    """Run standard evaluations without KL divergence streaming"""
+    task_name = config["task_name"]
+    task_results = {}
     vllm_models = {}
     
     # First pass: Run evaluations on all models
     for models in model_groups:
         base_model = models[0]
         group_dir = group_dirs[base_model]
-        
-        # Store results for this model group
         group_results = {}
         
+        # Evaluate each model in sequence
         for model_name in models:
             # Check if this is a vLLM quantized model
             is_vllm_model = is_vllm_quantized_model(model_name)
@@ -247,15 +627,14 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
                 config["model"] = "vllm"
                 config["model_args"] = f"pretrained={model_name},max_model_len=4096,gpu_memory_utilization=0.8,tensor_parallel_size=1"
                 config["batch_size"] = "auto"
-                # Clean up any previous vLLM processes
                 cleanup_vllm_processes()
             else:
                 config["model"] = "hf"
-            config["model_args"] = f"pretrained={model_name}"
+                config["model_args"] = f"pretrained={model_name}"
             
             config["limit"] = None  # Set to None for full evaluation or some number for testing
             
-            # Get the model directory (without samples subdirectory)
+            # Get the model directory
             model_dir = os.path.join(group_dir, get_model_dir(model_name))
             samples_dir = os.path.join(model_dir, "samples")
             os.makedirs(samples_dir, exist_ok=True)
@@ -264,14 +643,12 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
             print(f"Using engine: {config['model']}")
             clear_memory()
             
-            # Initialize the tracker with the model-specific directory and model name
+            # Initialize the tracker
             eval_tracker = EvaluationTracker(output_path=model_dir)
-            # Make sure model_name is set in the tracker's config
             eval_tracker.general_config_tracker.model_name_sanitized = model_name
-            eval_tracker.general_config_tracker.model_name_sanitized = "samples"
             eval_tracker.date_id = datetime.now().isoformat().replace(":", "-")
             
-            # Pass the model directory as output_path for storing logits
+            # Standard evaluation
             results = lm_eval.simple_evaluate(
                 model=config["model"],
                 model_args=config["model_args"],
@@ -280,25 +657,18 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
                 batch_size=config.get("batch_size", None),
                 limit=config.get("limit", None),
                 log_samples=True,
-                output_path=model_dir
             )
             md = lm_eval.utils.make_table(results)
             
             # Extract and save samples if they exist
             if "samples" in results:
                 samples = results.pop("samples")
-                # Create samples directory
-                samples_dir = os.path.join(model_dir, "samples")
-                os.makedirs(samples_dir, exist_ok=True)
-                
-                # Save samples for each task using the tracker only
-                for task_name, task_samples in samples.items():
-                    # Use the tracker to save samples
+                for task_name_key, task_samples in samples.items():
                     eval_tracker.save_results_samples(
-                        task_name=task_name,
+                        task_name=task_name_key,
                         samples=task_samples
                     )
-                    print(f"Samples for {task_name} saved via tracker to {model_dir}")
+                    print(f"Samples for {task_name_key} saved via tracker to {model_dir}")
             
             # Extract the raw results data
             results_dict = results["results"][task_name]
@@ -314,7 +684,7 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
             with open(results_json_filename, "w") as f:
                 json.dump(results_dict, f, indent=2)
                 
-            # Store results for recovery calculation
+            # Store results for flip calculation
             group_results[model_name] = {
                 "accuracy": accuracy,
                 "results": results_dict
@@ -324,6 +694,13 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
         
         # Store the group results
         task_results[base_model] = group_results
+    
+    # Continue with flip analysis
+    _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False)
+
+def _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False):
+    """Run flip evaluation and KL analysis (shared between both approaches)"""
+    task_name = config["task_name"]
     
     # Second pass: Run flip evaluation and calculate recovery percentage for each model group
     print(f"\nRunning flip evaluations for {task_name}")
@@ -355,7 +732,7 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
             # Check if either model uses vLLM (for KL divergence calculation)
             base_uses_vllm = vllm_models.get(base_model, False)
             new_uses_vllm = vllm_models.get(new_model, False)
-            skip_kl = base_uses_vllm or new_uses_vllm
+            skip_kl = base_uses_vllm or new_uses_vllm or not kl_divergence
             
             # Find the JSONL files for this task
             base_jsonl_files = find_task_jsonl_files(group_dir, base_model_dir, task_name)
@@ -387,7 +764,6 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
                 
                 with open(flip_results_filename, "w") as f:
                     f.write(f"FLIP ANALYSIS: {base_model} vs {new_model} on {task_name}\n")
-                    print(base_accuracy)
                     f.write(f"Base Accuracy: {base_accuracy:.4f}\n")
                     f.write(f"New Accuracy: {new_accuracy:.4f}\n")
                     f.write(f"Recovery: {recovery_pct:.2f}%\n")
@@ -420,17 +796,12 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
                 print(f"Detailed flip results saved to {flip_results_filename}")
                 print(f"Recovery percentage: {recovery_pct:.2f}%")
                 
-                # Run KL evaluation
-                # Get the paths to the tensor files directories
-                base_model_path = os.path.join(group_dir, base_model_dir)
-                new_model_path = os.path.join(group_dir, new_model_dir)
-                
-                if skip_kl:
-                    print(f"\nSkipping KL divergence calculation because one or both models use vLLM")
-                    print(f"  Base model uses vLLM: {base_uses_vllm}")
-                    print(f"  New model uses vLLM: {new_uses_vllm}")
-                else:
+                # Run KL evaluation (only if enabled and not skipped)
+                if not skip_kl:
                     print(f"\nCalculating KL divergence between {base_model} and {new_model}")
+                    base_model_path = os.path.join(group_dir, base_model_dir)
+                    new_model_path = os.path.join(group_dir, new_model_dir)
+                    
                     try:
                         # Initialize KL evaluator
                         kl_evaluator = KLEval(base_model_path, new_model_path)
@@ -452,13 +823,22 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
                             print(f"Warning: KL divergence for task {task_name} not available")
                     except Exception as e:
                         print(f"Error calculating KL divergence: {e}")
-                        raise e
+                elif skip_kl:
+                    if not kl_divergence:
+                        print(f"\nSkipping KL divergence calculation because kl_divergence flag is False")
+                    else:
+                        print(f"\nSkipping KL divergence calculation because one or both models use vLLM")
+                        print(f"  Base model uses vLLM: {base_uses_vllm}")
+                        print(f"  New model uses vLLM: {new_uses_vllm}")
             else:
                 print(f"ERROR: Could not find JSONL files for task {task_name} with models {models}")
                 if not base_jsonl_files:
                     print(f"Missing base model JSONL files in {base_model_dir}")
                 if not new_jsonl_files:
                     print(f"Missing new model JSONL files in {new_model_dir}")
+        
+        # Save aggregated metrics and create markdown summary (same as before)
+        # ... (rest of the function remains the same)
         
         # Save aggregated metrics to model group directory
         aggregated_filename = os.path.join(group_dir, f"{task_name}_aggregated_metrics.json")
@@ -512,29 +892,35 @@ def run_task_evaluations_and_flips(config, model_groups, group_dirs):
 
 if __name__ == "__main__":
     torch.multiprocessing.set_start_method('spawn')
+    
+    # Configuration for KL divergence evaluation
+    # Set to True to use hf_kl model and calculate KL divergence, False to use hf model only
+    KL_DIVERGENCE_ENABLED = False
+    
     # Create directory structure first
     print("Creating directory structure...")
     group_dirs = create_directory_structure(model_groups)
     
     # Run evaluations for each config
-    configs = [hellaswag_config, mmlu_config, arc_c_config, 
+    configs = [mmlu_config, arc_c_config, 
               gsm8kcot_config, winogrande_config, truthfulqa_config]
     
-    # # For testing, you may want to run just one config
-    #configs = [hellaswag_config]
+    # # # For testing, you may want to run just one config
+    # configs = [hellaswag_config]
     
     # Create a metadata file with run information
     metadata = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "model_groups": model_groups,
-        "configs": [config["task_name"] for config in configs]
+        "configs": [config["task_name"] for config in configs],
+        "kl_divergence_enabled": KL_DIVERGENCE_ENABLED
     }
     
     with open(os.path.join(OUTPUT_DIR, "run_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
     
     for config in configs:
-        run_task_evaluations_and_flips(config, model_groups, group_dirs)
+        run_task_evaluations_and_flips(config, model_groups, group_dirs, kl_divergence=KL_DIVERGENCE_ENABLED)
     
     # Clean up any remaining vLLM processes
     cleanup_vllm_processes()

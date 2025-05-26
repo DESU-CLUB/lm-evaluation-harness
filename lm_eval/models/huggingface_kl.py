@@ -43,8 +43,8 @@ from lm_eval.models.utils import (
 eval_logger = logging.getLogger(__name__)
 
 
-@register_model("hf-auto", "hf", "huggingface")
-class HFLM(TemplateLM):
+@register_model("hf_kl")
+class HFLM_KL(TemplateLM):
     """
     An abstracted Huggingface model class. Enables usage with both models of
     `transformers.AutoModelForCausalLM` and `transformers.AutoModelForSeq2SeqLM` classes.
@@ -1098,6 +1098,7 @@ class HFLM(TemplateLM):
             and not override_bs
             else None
         )
+        
 
         chunks = re_ord.get_batched(n=batch_size, batch_fn=batch_fn)
         pbar = tqdm(
@@ -1136,7 +1137,7 @@ class HFLM(TemplateLM):
                 if self.backend == "causal":
                     total_length = len(context_enc) + len(continuation_enc)
                     if total_length > self.max_length + 1:
-                        eval_logger.warning(
+                        eval_logger.warn(
                             f"Combined length of context ({len(context_enc)}) and continuation ({len(continuation_enc)}) "
                             f"exceeds model's maximum length ({self.max_length}). "
                             f"Truncating {total_length - self.max_length + 1} tokens from the left."
@@ -1190,18 +1191,18 @@ class HFLM(TemplateLM):
             if self.backend == "causal":
                 batched_inps = pad_and_concat(
                     padding_len_inp, inps, padding_side="right"
-                )  # [batch, padding_len_inp]
+                )
             elif self.backend == "seq2seq":
                 # TODO: left-pad encoder inps and mask?
                 batched_inps = pad_and_concat(
                     padding_len_inp, inps
-                )  # [batch, padding_len_inp]
+                )
                 batched_conts = pad_and_concat(
                     padding_len_cont, conts
-                )  # [batch, padding_len_cont]
+                )
                 batched_encoder_mask = pad_and_concat(
                     padding_len_inp, encoder_attns
-                )  # [batch, padding_len_inp]
+                )
                 call_kwargs = {
                     "attn_mask": batched_encoder_mask,
                     "labels": batched_conts,
@@ -1247,22 +1248,18 @@ class HFLM(TemplateLM):
                     cont_toks = torch.tensor(
                         cont_toks, dtype=torch.long, device=self.device
                     ).unsqueeze(0)  # [1, seq]
-                    # Use trailing slice [-cont_toks.shape[1]:] to handle variable length cont_len (but same ctx+cont[:-1]).
-                    # i.e. continuations can be sliced at diff points. Collator ensures we have sufficient greedy_tokens
-                    # by choosing key with longest cont if group_by="contexts".
-                    max_equal = (
-                        greedy_tokens[:, -cont_toks.shape[1] :] == cont_toks
-                    ).all()
-
-                    # Obtain log-probs at the corresponding continuation token indices
-                    # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
-                    logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(
-                        -1
-                    )  # [1, seq]
-
-                    # Answer: (log prob, is-exact-match)
-                    answer = (float(logits.sum()), bool(max_equal))
-
+                    max_equal = (greedy_tokens == cont_toks).all()
+                    
+                    # Yield the full logits
+                    full_logits = logits.clone().detach().cpu()
+                    yield full_logits
+                    
+                    # Get log probs at continuation token positions
+                    logits_result = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)  # [1, seq]
+                    log_prob = float(logits_result.sum())
+                    
+                    # Return log probability and whether the continuation was the greedy choice
+                    answer = (log_prob, bool(max_equal))
                     res.append(answer)
 
                     if request_str is not None:
@@ -1273,6 +1270,12 @@ class HFLM(TemplateLM):
                             "loglikelihood", request_str, answer
                         )
                     pbar.update(1)
+
+            # Manual garbage collection after each chunk
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         pbar.close()
 

@@ -1,354 +1,186 @@
-import torch
 import os
-from typing import Dict, List, Any, Optional
-import glob
 import json
+import glob
+from typing import Any, Dict, List, Optional
+
+import torch
+
 
 class KLEval:
-    def __init__(self, base_model_dir: str, new_model_dir: str):
-        """
-        Initialize KLEval with paths to the model directories containing manifest.pt or task-specific tensor files
-        
-        Args:
-            base_model_dir: Directory for base model tensor data
-            new_model_dir: Directory for new (quantized) model tensor data
-        """
-        self.base_model_dir = base_model_dir
-        self.new_model_dir = new_model_dir
-        
-        # Load manifests if they exist or find task files directly
-        self.base_manifest = self._load_manifest(base_model_dir)
-        self.new_manifest = self._load_manifest(new_model_dir)
+    """Utility class to compute KL-divergence between two sets of logits saved by the
+    updated evaluator.  It understands the *new* manifest.json layout but keeps
+    backward-compatibility with the older .pt manifest and single-file format.
+    """
 
-    def _load_manifest(self, model_dir: str) -> Dict[str, Any]:
-        """Load manifest.pt file or gather task files if no manifest exists"""
-        manifest_path = os.path.join(model_dir, "manifest.pt")
-        
-        if os.path.exists(manifest_path):
-            return torch.load(manifest_path)
-        else:
-            # Try to find task files directly
-            task_files = glob.glob(os.path.join(model_dir, "*.pt"))
-            # Exclude any manifest file that might be in the list
-            task_files = [f for f in task_files if os.path.basename(f) != "manifest.pt"]
-            
-            if not task_files:
-                # Look for files in a *_logits subdirectory
-                logit_dirs = [d for d in os.listdir(model_dir) if d.endswith("_logits") and os.path.isdir(os.path.join(model_dir, d))]
-                for logit_dir in logit_dirs:
-                    task_files.extend(glob.glob(os.path.join(model_dir, logit_dir, "*.pt")))
-                
-                # Look for *_tensors subdirectories (new format)
-                tensor_dirs = [d for d in os.listdir(model_dir) if d.endswith("_tensors") and os.path.isdir(os.path.join(model_dir, d))]
-                task_files_from_tensors = []
-                
-                for tensor_dir in tensor_dirs:
-                    # Check for manifest.json in the tensor directory
-                    tensor_dir_path = os.path.join(model_dir, tensor_dir)
-                    manifest_json_path = os.path.join(tensor_dir_path, "manifest.json")
-                    
-                    if os.path.exists(manifest_json_path):
-                        # Use the manifest to get task info
-                        with open(manifest_json_path, 'r') as f:
-                            tensor_manifest = json.load(f)
-                        
-                        task_name = tensor_manifest.get('task_name', os.path.basename(tensor_dir).replace("_tensors", ""))
-                        task_files_from_tensors.append({
-                            "task_name": task_name,
-                            "is_tensor_dir": True,
-                            "dir_path": tensor_dir_path,
-                            "tensor_count": tensor_manifest.get('tensor_count', 0)
-                        })
-                    else:
-                        # No manifest, try to infer from directory structure
-                        task_name = os.path.basename(tensor_dir).replace("_tensors", "")
-                        # Count tensor files
-                        tensor_files = glob.glob(os.path.join(tensor_dir_path, "tensor_*.pt"))
-                        task_files_from_tensors.append({
-                            "task_name": task_name,
-                            "is_tensor_dir": True,
-                            "dir_path": tensor_dir_path,
-                            "tensor_count": len(tensor_files)
-                        })
-            
-            if not task_files and not task_files_from_tensors:
-                raise FileNotFoundError(f"No manifest.pt, task tensor files, or tensor directories found in {model_dir}")
-                
-            # Create a synthetic manifest
-            if task_files:
-                # Old format with individual task files
-                return {
-                    "model": os.path.basename(model_dir),
-                    "task_files": [
-                        {"task_name": os.path.basename(f).replace(".pt", ""), "file": f}
-                        for f in task_files
-                    ]
-                }
+    # ---------------------------------------------------------------------
+    # Construction helpers
+    # ---------------------------------------------------------------------
+    def __init__(self, base_model_dir: str, new_model_dir: str):
+        self.base_root = os.path.abspath(base_model_dir)
+        self.new_root = os.path.abspath(new_model_dir)
+
+        self.base_manifest = self._load_root_manifest(self.base_root)
+        self.new_manifest = self._load_root_manifest(self.new_root)
+
+    # ------------------------------------------------------------------
+    # Manifest loading
+    # ------------------------------------------------------------------
+    def _load_root_manifest(self, model_dir: str) -> Dict[str, Any]:
+        """Load the *root* manifest that sits directly inside a model output dir.
+
+        1.  Preferred:  JSON manifest produced by the new evaluator
+        """
+        json_path = os.path.join(model_dir, "manifest.json")
+
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"Expected manifest.json not found in {model_dir}. Old formats are no longer supported.")
+
+        with open(json_path, "r") as f:
+            m = json.load(f)
+
+        # Normalise any relative dir_path fields to absolute paths
+        for tf in m.get("task_files", []):
+            if tf.get("is_tensor_dir") and "dir_path" in tf and not os.path.isabs(tf["dir_path"]):
+                tf["dir_path"] = os.path.abspath(tf["dir_path"])
+
+        return m
+
+    # ------------------------------------------------------------------
+    # Tensor loading helpers
+    # ------------------------------------------------------------------
+    def _load_tensors_from_task(self, task_entry: Dict[str, Any]) -> List[torch.Tensor]:
+        """Return a flat list of tensors for a single task, loading lazily from
+        chunk files or individual tensor files according to the entry.
+        """
+        # Expected new format: a tensor directory with its own manifest
+        if not task_entry.get("is_tensor_dir"):
+            raise ValueError("Only tensor-directory tasks are supported in the current format")
+
+        tdir = task_entry["dir_path"]
+        t_manifest_path = os.path.join(tdir, "manifest.json")
+        if not os.path.exists(t_manifest_path):
+            raise FileNotFoundError(f"Per-task manifest.json missing in {tdir}")
+
+        with open(t_manifest_path, "r") as f:
+            t_manifest = json.load(f)
+
+        chunk_files = [c["new_file"] for c in t_manifest["chunks"]]
+        print(chunk_files)
+
+        tensors: List[torch.Tensor] = []
+        for cf in chunk_files:
+            chunk = torch.load(cf, map_location="cpu")
+            if isinstance(chunk, list):
+                tensors.extend(chunk)
             else:
-                # New format with tensor directories
-                return {
-                    "model": os.path.basename(model_dir),
-                    "task_files": task_files_from_tensors
-                }
-    
-    def _get_matching_task_files(self, task_filter: str = None) -> List[Dict[str, Any]]:
-        """
-        Match task files between base and new model
-        
-        Args:
-            task_filter: Optional filter to only process specific task(s)
-        """
-        # Filter out manifest.pt from task files and extract task names
-        base_tasks = {}
-        for task_file in self.base_manifest.get("task_files", []):
-            task_name = task_file["task_name"]
-            if task_name.lower() != "manifest":  # Explicitly filter out manifest.pt
-                base_tasks[task_name] = task_file
-        
-        new_tasks = {}
-        for task_file in self.new_manifest.get("task_files", []):
-            task_name = task_file["task_name"]
-            if task_name.lower() != "manifest":  # Explicitly filter out manifest.pt
-                new_tasks[task_name] = task_file
-        
-        # Apply task filter if specified
-        if task_filter:
-            base_tasks = {name: info for name, info in base_tasks.items() if task_filter in name}
-            new_tasks = {name: info for name, info in new_tasks.items() if task_filter in name}
-            print(f"Filtered to tasks matching '{task_filter}'")
-        
-        print(f"Base model tasks after filtering: {list(base_tasks.keys())}")
-        print(f"New model tasks after filtering: {list(new_tasks.keys())}")
-        
-        # Find common tasks
-        common_tasks = set(base_tasks.keys()) & set(new_tasks.keys())
-        
-        if not common_tasks:
-            raise ValueError(f"No common tasks found between base and new models{' matching filter ' + task_filter if task_filter else ''}")
-            
-        print(f"Found {len(common_tasks)} matching tasks: {sorted(list(common_tasks))}")
-        
-        return [
-            {
-                "task_name": task_name,
-                "base_info": base_tasks[task_name],
-                "new_info": new_tasks[task_name]
-            }
-            for task_name in common_tasks
-        ]
-    
-    def _load_tensors_from_directory(self, tensor_dir: str, start_idx: int = 0, end_idx: int = None) -> List[torch.Tensor]:
-        """
-        Load tensors from a directory containing individual tensor files
-        
-        Args:
-            tensor_dir: Directory containing tensor_*.pt files
-            start_idx: Starting index for tensors to load
-            end_idx: Ending index for tensors to load (None means load all)
-            
-        Returns:
-            List of loaded tensors
-        """
-        if end_idx is None:
-            # Try to get tensor count from manifest
-            manifest_path = os.path.join(tensor_dir, "manifest.json")
-            if os.path.exists(manifest_path):
-                with open(manifest_path, 'r') as f:
-                    manifest = json.load(f)
-                end_idx = manifest.get("tensor_count", 0)
-            
-            # If still None, count files
-            if end_idx is None or end_idx == 0:
-                tensor_files = glob.glob(os.path.join(tensor_dir, "tensor_*.pt"))
-                end_idx = len(tensor_files)
-        
-        tensors = []
-        for i in range(start_idx, end_idx):
-            tensor_path = os.path.join(tensor_dir, f"tensor_{i:06d}.pt")
-            if os.path.exists(tensor_path):
-                tensors.append(torch.load(tensor_path))
-            else:
-                print(f"Warning: Missing tensor file {tensor_path}")
-        
+                tensors.append(chunk)
+
         return tensors
 
-    @torch.no_grad()
-    def calculate_per_task_kl(self, task_filter: str = None, return_details: bool = False) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # KL computation helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _kl_divergence(p_logits: torch.Tensor, q_logits: torch.Tensor) -> float:
+        """Compute mean token-level KL-divergence between two logits tensors.
+        Shapes must match (seq, vocab) or (1, seq, vocab).  Returns scalar.
         """
-        Calculate KL divergence per task, handling MCQ tasks differently
+        if p_logits.shape != q_logits.shape:
+            raise ValueError("Logit shape mismatch: " + str((p_logits.shape, q_logits.shape)))
+
+        # Convert to log probabilities and calculate per-token KL
+        base_log_probs = p_logits.log_softmax(dim=-1)
+        new_log_probs = q_logits.log_softmax(dim=-1)
+        token_kls = torch.nn.functional.kl_div(
+            new_log_probs,
+            base_log_probs.exp(),
+            reduction='none'
+        ).sum(dim=-1)  # Sum across vocabulary
         
-        Args:
-            task_filter: Optional filter string to only process specific tasks
-            return_details: Whether to include detailed per-sample KL values
-        
-        Returns:
-            Dictionary with KL divergence results
-        """
-        results = {}
-        matched_tasks = self._get_matching_task_files(task_filter=task_filter)
-        
-        # Process each task
-        for task_info in matched_tasks:
-            task_name = task_info["task_name"]
-            print(f"Processing task: {task_name}")
-            
+        # Mean KL for this option
+        option_kl = token_kls.mean().item()
+        return option_kl
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def calculate_per_task_kl(self, task_filter: Optional[str] = None, return_details: bool = False) -> Dict[str, Any]:
+        """Compute KL for all common tasks between the two models."""
+        # Build dicts task_name -> entry
+        base_tasks = {t["task_name"]: t for t in self.base_manifest.get("task_files", [])}
+        new_tasks = {t["task_name"]: t for t in self.new_manifest.get("task_files", [])}
+
+        if task_filter:
+            base_tasks = {k: v for k, v in base_tasks.items() if task_filter in k}
+            new_tasks = {k: v for k, v in new_tasks.items() if task_filter in k}
+            print(f"[INFO] Task filter='{task_filter}' → {list(base_tasks.keys())}")
+
+        common = sorted(set(base_tasks) & set(new_tasks))
+        if not common:
+            raise ValueError("No common tasks between models after filtering")
+
+        results: Dict[str, Any] = {}
+
+        for task_name in common:
+            print(f"[INFO] Processing task: {task_name}")
             try:
-                # Handle both old and new tensor formats
-                base_info = task_info["base_info"]
-                new_info = task_info["new_info"]
-                
-                # Check if this is a tensor directory format
-                if "is_tensor_dir" in base_info and base_info["is_tensor_dir"]:
-                    # New format with individual tensor files
-                    print(f"Loading tensors from directories")
-                    base_tensors = self._load_tensors_from_directory(base_info["dir_path"])
-                    new_tensors = self._load_tensors_from_directory(new_info["dir_path"])
-                    
-                    # Create synthetic task data
-                    base_task_data = {
-                        "task_name": task_name,
-                        "task_type": "multiple_choice" if "hellaswag" in task_name.lower() else "generative",
-                        "tensors": base_tensors
-                    }
-                    
-                    new_task_data = {
-                        "task_name": task_name,
-                        "task_type": base_task_data["task_type"],
-                        "tensors": new_tensors
-                    }
-                    
-                    # For MCQ tasks like hellaswag, try to determine options_per_question
-                    if base_task_data["task_type"] == "multiple_choice":
-                        # For hellaswag, each question typically has 4 options
-                        base_task_data["options_per_question"] = [4] * (len(base_tensors) // 4)
-                        if len(base_tensors) % 4 != 0:
-                            print(f"Warning: {task_name} has {len(base_tensors)} tensors, which is not a multiple of 4. Handling remainder.")
-                            # Add the remainder
-                            base_task_data["options_per_question"].append(len(base_tensors) % 4)
-                else:
-                    # Load task tensors from old format
-                    base_file = base_info["file"]
-                    new_file = new_info["file"]
-                    base_task_data = torch.load(base_file)
-                    new_task_data = torch.load(new_file)
-                
-                # Check for task type consistency
-                if "task_type" not in base_task_data:
-                    print(f"Warning: No task_type in {task_name}, assuming generative")
-                    task_type = "generative"
-                else:
-                    task_type = base_task_data["task_type"]
-                
-                # Debug info
-                print(f"Base task data keys: {base_task_data.keys()}")
-                
-                # Check if tensors exist in the data
-                if "tensors" not in base_task_data or "tensors" not in new_task_data:
-                    print(f"Error: 'tensors' key not found in task data for {task_name}")
+                base_entry = base_tasks[task_name]
+                new_entry = new_tasks[task_name]
+
+                base_tensors = self._load_tensors_from_task(base_entry)
+                new_tensors = self._load_tensors_from_task(new_entry)
+
+                if len(base_tensors) != len(new_tensors):
+                    print(f"[WARN] Sample count mismatch for {task_name}: {len(base_tensors)} vs {len(new_tensors)} – truncating to min")
+                    n = min(len(base_tensors), len(new_tensors))
+                    base_tensors = base_tensors[:n]
+                    new_tensors = new_tensors[:n]
+
+                if not base_tensors:
+                    print(f"[WARN] No tensors for task {task_name}; skipping")
                     continue
-                
-                # Extract tensors
-                base_task_tensors = base_task_data["tensors"]
-                new_task_tensors = new_task_data["tensors"]
-                
-                if not base_task_tensors or not new_task_tensors:
-                    print(f"Error: Empty tensors for task {task_name}")
-                    continue
-                
-                print(f"Found {len(base_task_tensors)} base tensors and {len(new_task_tensors)} new tensors")
-                
-                if len(base_task_tensors) != len(new_task_tensors):
-                    print(f"Warning: Different number of samples for task {task_name}: {len(base_task_tensors)} vs {len(new_task_tensors)}")
-                    continue
-                
-                # For MCQ tasks, we need to know the number of options per question
+
+                # Determine task type & mcq metadata (from per-task manifest if available)
+                task_type = "generative"
+                options_per_question: Optional[List[int]] = None
+
+                per_task_manifest_path = os.path.join(base_entry.get("dir_path", ""), "manifest.json")
+                if os.path.exists(per_task_manifest_path):
+                    with open(per_task_manifest_path, "r") as f:
+                        ptm = json.load(f)
+                    task_type = ptm.get("task_type", task_type)
+                    options_per_question = ptm.get("options_per_question")
+
+                # Multiple-choice KL: average per question
                 if task_type == "multiple_choice":
-                    # This will track KL per question
-                    question_kls = []
-                    options_per_question = base_task_data.get("options_per_question", [])
-                    
                     if not options_per_question:
-                        print(f"Warning: No options_per_question found for MCQ task {task_name}")
-                        # Try to infer from tensors
-                        options_per_question = [len(base_task_tensors)]
-                    
-                    option_index = 0
-                    for question_idx, num_options in enumerate(options_per_question):
-                        # Process all options for this question
-                        option_kls = []
-                        for i in range(num_options):
-                            if option_index >= len(base_task_tensors):
+                        # Fallback heuristic: assume 4 options
+                        options_per_question = [4] * (len(base_tensors) // 4)
+
+                    q_kls: List[float] = []
+                    idx = 0
+                    for num_opts in options_per_question:
+                        opts_kl = []
+                        for _ in range(num_opts):
+                            if idx >= len(base_tensors):
                                 break
-                                
-                            base_sample = base_task_tensors[option_index]
-                            new_sample = new_task_tensors[option_index]
-                            
-                            # Calculate KL for this option
-                            # Debug info for first tensor
-                            if question_idx == 0 and i == 0:
-                                print(f"Sample tensor type: {type(base_sample)}")
-                                print(f"Sample tensor shape: {base_sample.shape}")
-                            
-                            if base_sample.shape != new_sample.shape:
-                                print(f"Skipping option with mismatched shape in question {question_idx}: {base_sample.shape} vs {new_sample.shape}")
-                                option_index += 1
-                                continue
-                            
-                            # Convert to log probabilities and calculate per-token KL
-                            base_log_probs = base_sample.log_softmax(dim=-1)
-                            new_log_probs = new_sample.log_softmax(dim=-1)
-                            token_kls = torch.nn.functional.kl_div(
-                                new_log_probs,
-                                base_log_probs.exp(),
-                                reduction='none'
-                            ).sum(dim=-1)  # Sum across vocabulary
-                            
-                            # Mean KL for this option
-                            option_kl = token_kls.mean().item()
-                            option_kls.append(option_kl)
-                            option_index += 1
-                        
-                        # Calculate average KL for this question (across all options)
-                        if option_kls:
-                            question_kl = sum(option_kls) / len(option_kls)
-                            question_kls.append(question_kl)
-                    
-                    # Task-level KL is mean of all question KLs
-                    task_kl = sum(question_kls) / max(1, len(question_kls))
+                            kl_val = self._kl_divergence(base_tensors[idx], new_tensors[idx])
+                            opts_kl.append(kl_val)
+                            idx += 1
+                        if opts_kl:
+                            q_kls.append(sum(opts_kl) / len(opts_kl))
+
+                    mean_kl = sum(q_kls) / len(q_kls)
                     results[task_name] = {
-                        "mean_kl": task_kl,
+                        "mean_kl": mean_kl,
                         "type": "multiple_choice",
-                        "num_questions": len(question_kls),
+                        "num_questions": len(q_kls),
                     }
                     if return_details:
-                        results[task_name]["per_question_kls"] = question_kls
-                else:
-                    # For generative tasks - simpler calculation
-                    sample_kls = []
-                    for idx, (base_sample, new_sample) in enumerate(zip(base_task_tensors, new_task_tensors)):
-                        # Debug info for first tensor
-                        if idx == 0:
-                            print(f"Sample tensor shape: {base_sample.shape}")
-                        
-                        if base_sample.shape != new_sample.shape:
-                            print(f"Skipping sample with mismatched shapes in task {task_name}")
-                            continue
-                        
-                        # Convert to log probabilities
-                        base_log_probs = base_sample.log_softmax(dim=-1)
-                        new_log_probs = new_sample.log_softmax(dim=-1)
-                        
-                        # Sum KL per token first (across vocabulary)
-                        token_kls = torch.nn.functional.kl_div(
-                            new_log_probs,
-                            base_log_probs.exp(),
-                            reduction='none'
-                        ).sum(dim=-1)
-                        
-                        # Mean across sequence
-                        sample_kl = token_kls.mean().item()
-                        sample_kls.append(sample_kl)
-                    
+                        results[task_name]["per_question_kls"] = q_kls
+
+                else:  # generative
+                    sample_kls = [self._kl_divergence(b, n) for b, n in zip(base_tensors, new_tensors)]
                     # Task-level KL is mean of all sample KLs
                     task_kl = sum(sample_kls) / max(1, len(sample_kls))
                     results[task_name] = {
@@ -358,95 +190,334 @@ class KLEval:
                     }
                     if return_details:
                         results[task_name]["per_sample_kls"] = sample_kls
-                
-                # Clean up to save memory
-                del base_task_tensors
-                del new_task_tensors
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
+
             except Exception as e:
                 print(f"Error processing task {task_name}: {e}")
-                import traceback
-                traceback.print_exc()
-        
+
+            # Cleanup memory between tasks
+            del base_tensors, new_tensors
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
         # Calculate overall KL across all tasks
         if results:
             overall_kl = sum(task["mean_kl"] for task in results.values()) / len(results)
             results["overall"] = {"mean_kl": overall_kl}
-        
+
         return results
 
-    def save_kl_results(self, output_path: str = None, task_filter: str = None):
+    # ------------------------------------------------------------------
+    # Save helper
+    # ------------------------------------------------------------------
+    def save_kl_results(self, output_path: Optional[str] = None, task_filter: Optional[str] = None):
+        res = self.calculate_per_task_kl(task_filter=task_filter, return_details=True)
+
+        if output_path is None:
+            b_name = os.path.basename(self.base_root)
+            n_name = os.path.basename(self.new_root)
+            suffix = f"_{task_filter}" if task_filter else ""
+            output_path = f"kl_results_{b_name}_vs_{n_name}{suffix}"
+
+        output_path = os.path.splitext(output_path)[0]
+
+        torch.save(res, f"{output_path}.pt")
+        with open(f"{output_path}.json", "w") as f:
+            json.dump(res, f, indent=2)
+        print(f"[INFO] Results saved to {output_path}.pt/.json")
+
+        # Pretty summary
+        print("\nKL Divergence Summary")
+        print("=" * 40)
+        for t, d in res.items():
+            if t == "overall":
+                continue
+            print(f"{t:20s} : {d['mean_kl']:.6f}")
+        print("-" * 40)
+        print(f"OVERALL            : {res['overall']['mean_kl']:.6f}")
+
+        return res
+
+    # ------------------------------------------------------------------
+    # Real-time KL computation for streaming logits
+    # ------------------------------------------------------------------
+    @staticmethod
+    def compute_streaming_kl(base_logits_queue, new_logits_queue, buffer_size=100, task_metadata=None):
         """
-        Calculate KL divergence and save results to files (.pt and .json)
+        Compute KL divergence from two queues of logits.
+        Collects all logits from both queues, converts to tensors, and computes KL.
         
         Args:
-            output_path: Path to save results (without extension)
-            task_filter: Optional filter to only process specific tasks
+            base_logits_queue: Queue containing base model logits
+            new_logits_queue: Queue containing new model logits  
+            buffer_size: Unused (kept for compatibility)
+            task_metadata: Dict with task_name, task_type, and MCQ metadata
             
         Returns:
-            Dictionary with KL divergence results
+            Dict with KL divergence statistics
         """
-        results = self.calculate_per_task_kl(task_filter=task_filter, return_details=True)
+        import queue
         
-        if output_path is None:
-            # Create default output path
-            base_model_name = os.path.basename(self.base_model_dir)
-            new_model_name = os.path.basename(self.new_model_dir)
-            task_suffix = f"_{task_filter}" if task_filter else ""
-            output_path = f"kl_results_{base_model_name}_vs_{new_model_name}{task_suffix}"
+        # Extract metadata
+        if task_metadata is None:
+            task_metadata = {'task_name': 'unknown', 'task_type': 'generative'}
         
-        # Remove any extension from output_path
-        output_path = os.path.splitext(output_path)[0]
+        task_name = task_metadata.get('task_name', 'unknown')
+        task_type = task_metadata.get('task_type', 'generative') 
+        default_options = task_metadata.get('default_options', 4)
         
-        # Save results in PyTorch format
-        pt_path = f"{output_path}.pt"
-        torch.save(results, pt_path)
-        print(f"KL results saved to {pt_path}")
+        base_logits_list = []
+        new_logits_list = []
         
-        # Also save as JSON for easier inspection
-        import json
+        print(f"[INFO] Collecting logits from queues for {task_name} (type: {task_type})")
         
-        # Create a JSON-serializable version of the results
-        json_results = {}
-        for task_name, task_data in results.items():
-            json_results[task_name] = {
-                key: (value if not isinstance(value, torch.Tensor) else value.item() 
-                     if value.numel() == 1 else value.tolist())
-                for key, value in task_data.items()
+        # Collect all logits from base model queue
+        print(f"[INFO] Collecting base model logits...")
+        while True:
+            try:
+                logits = base_logits_queue.get(timeout=60)  # Longer timeout for model completion
+                if logits is None:  # Sentinel value indicates end of stream
+                    print(f"[INFO] Base model finished, collected {len(base_logits_list)} logits")
+                    break
+                base_logits_list.append(logits)
+                if len(base_logits_list) % 100 == 0:
+                    print(f"[INFO] Base model: collected {len(base_logits_list)} logits")
+            except queue.Empty:
+                print(f"[WARN] Timeout waiting for base model logits")
+                break
+        
+        # Collect all logits from new model queue  
+        print(f"[INFO] Collecting new model logits...")
+        while True:
+            try:
+                logits = new_logits_queue.get(timeout=60)
+                if logits is None:  # Sentinel value indicates end of stream
+                    print(f"[INFO] New model finished, collected {len(new_logits_list)} logits")
+                    break
+                new_logits_list.append(logits)
+                if len(new_logits_list) % 100 == 0:
+                    print(f"[INFO] New model: collected {len(new_logits_list)} logits")
+            except queue.Empty:
+                print(f"[WARN] Timeout waiting for new model logits")
+                break
+        
+        # Check if we have matching numbers of logits
+        if len(base_logits_list) != len(new_logits_list):
+            print(f"[WARN] Mismatched logits count: base={len(base_logits_list)}, new={len(new_logits_list)}")
+            # Truncate to minimum length
+            min_len = min(len(base_logits_list), len(new_logits_list))
+            base_logits_list = base_logits_list[:min_len]
+            new_logits_list = new_logits_list[:min_len]
+            print(f"[INFO] Truncated to {min_len} logits for comparison")
+        
+        if not base_logits_list or not new_logits_list:
+            print(f"[ERROR] No logits collected for {task_name}")
+            return {
+                "task_name": task_name,
+                "mean_kl": 0.0,
+                "num_samples": 0,
+                "type": "streaming",
+                "error": "No logits collected"
             }
         
-        json_path = f"{output_path}.json"
-        with open(json_path, "w") as f:
-            json.dump(json_results, f, indent=2)
-        print(f"JSON results saved to {json_path}")
+        # Compute KL divergence based on task type
+        if task_type == "multiple_choice":
+            options_per_question = task_metadata.get('options_per_question')
+            
+            if options_per_question:
+                # Handle variable options per question
+                print(f"[INFO] Computing MCQ KL divergence with variable options per question")
+                question_kls = []
+                idx = 0
+                
+                for q, num_opts in enumerate(options_per_question):
+                    if idx + num_opts > len(base_logits_list):
+                        print(f"[WARN] Not enough logits for question {q} (need {num_opts}, have {len(base_logits_list) - idx})")
+                        break
+                        
+                    # Compute KL for each option in this question
+                    option_kls = []
+                    for opt in range(num_opts):
+                        if idx >= len(base_logits_list):
+                            break
+                        try:
+                            kl = KLEval._kl_divergence(base_logits_list[idx], new_logits_list[idx])
+                            option_kls.append(kl)
+                        except Exception as e:
+                            print(f"[WARN] KL computation error for question {q}, option {opt}: {e}")
+                        idx += 1
+                    
+                    # Average KL across options for this question
+                    if option_kls:
+                        question_kl = sum(option_kls) / len(option_kls)
+                        question_kls.append(question_kl)
+                        
+                        if (q + 1) % 100 == 0:
+                            current_mean = sum(question_kls) / len(question_kls)
+                            print(f"[INFO] Processed {q + 1}/{len(options_per_question)} questions, current mean KL: {current_mean:.6f}")
+                
+                # Calculate final statistics
+                if question_kls:
+                    mean_kl = sum(question_kls) / len(question_kls)
+                    min_kl = min(question_kls)
+                    max_kl = max(question_kls)
+                    
+                    result = {
+                        "task_name": task_name,
+                        "mean_kl": mean_kl,
+                        "min_kl": min_kl,
+                        "max_kl": max_kl,
+                        "num_questions": len(question_kls),
+                        "num_samples": idx,  # Total options processed
+                        "type": "multiple_choice",
+                        "variable_options": True,
+                        "options_per_question": options_per_question[:len(question_kls)]
+                    }
+                    
+                    print(f"[INFO] Final variable MCQ KL stats for {task_name}:")
+                    print(f"       Mean: {mean_kl:.6f}")
+                    print(f"       Questions: {len(question_kls)}")
+                    print(f"       Total options: {idx}")
+                    
+                    return result
+                else:
+                    return {
+                        "task_name": task_name,
+                        "mean_kl": 0.0,
+                        "num_questions": 0,
+                        "type": "multiple_choice",
+                        "error": "No valid variable question KL computations"
+                    }
+            
+            else:
+                # Handle fixed options per question (original logic)
+                print(f"[INFO] Computing MCQ KL divergence for {len(base_logits_list)} logits with {default_options} options per question")
+                
+                # Group logits by questions (assume default_options per question)
+                num_questions = len(base_logits_list) // default_options
+                if len(base_logits_list) % default_options != 0:
+                    print(f"[WARN] Logits count {len(base_logits_list)} not divisible by {default_options}, truncating")
+                    num_questions = len(base_logits_list) // default_options
+                    base_logits_list = base_logits_list[:num_questions * default_options]
+                    new_logits_list = new_logits_list[:num_questions * default_options]
+                
+                question_kls = []
+                
+                for q in range(num_questions):
+                    start_idx = q * default_options
+                    end_idx = start_idx + default_options
+                    
+                    # Compute KL for each option in this question
+                    option_kls = []
+                    for i in range(start_idx, end_idx):
+                        try:
+                            kl = KLEval._kl_divergence(base_logits_list[i], new_logits_list[i])
+                            option_kls.append(kl)
+                        except Exception as e:
+                            print(f"[WARN] KL computation error for question {q}, option {i-start_idx}: {e}")
+                            continue
+                    
+                    # Average KL across options for this question
+                    if option_kls:
+                        question_kl = sum(option_kls) / len(option_kls)
+                        question_kls.append(question_kl)
+                        
+                        if (q + 1) % 100 == 0:
+                            current_mean = sum(question_kls) / len(question_kls)
+                            print(f"[INFO] Processed {q + 1}/{num_questions} questions, current mean KL: {current_mean:.6f}")
+                
+                # Calculate final statistics across questions
+                if question_kls:
+                    mean_kl = sum(question_kls) / len(question_kls)
+                    min_kl = min(question_kls) 
+                    max_kl = max(question_kls)
+                    
+                    result = {
+                        "task_name": task_name,
+                        "mean_kl": mean_kl,
+                        "min_kl": min_kl,
+                        "max_kl": max_kl,
+                        "num_questions": len(question_kls),
+                        "num_samples": len(base_logits_list),
+                        "type": "multiple_choice",
+                        "options_per_question": default_options
+                    }
+                    
+                    print(f"[INFO] Final MCQ KL stats for {task_name}:")
+                    print(f"       Mean: {mean_kl:.6f}")
+                    print(f"       Min:  {min_kl:.6f}") 
+                    print(f"       Max:  {max_kl:.6f}")
+                    print(f"       Questions: {len(question_kls)}")
+                    print(f"       Total options: {len(base_logits_list)}")
+                    
+                    return result
+                else:
+                    print(f"[ERROR] No valid question KL computations for {task_name}")
+                    return {
+                        "task_name": task_name,
+                        "mean_kl": 0.0,
+                        "num_questions": 0,
+                        "type": "multiple_choice",
+                        "error": "No valid question KL computations"
+                    }
         
-        # Print a summary
-        print("\nKL Divergence Summary:")
-        print("=" * 50)
-        for task_name, task_results in results.items():
-            if task_name != "overall":
-                print(f"{task_name}: {task_results['mean_kl']:.6f}")
-        print("-" * 50)
-        print(f"Overall KL: {results['overall']['mean_kl']:.6f}")
-        
-        return results
-        
+        else:  # Generative task
+            print(f"[INFO] Computing generative KL divergence for {len(base_logits_list)} sample pairs")
+            kl_values = []
+            
+            for i, (base_logits, new_logits) in enumerate(zip(base_logits_list, new_logits_list)):
+                try:
+                    kl = KLEval._kl_divergence(base_logits, new_logits)
+                    kl_values.append(kl)
+                    
+                    if (i + 1) % 100 == 0:
+                        current_mean = sum(kl_values) / len(kl_values)
+                        print(f"[INFO] Processed {i + 1}/{len(base_logits_list)}, current mean KL: {current_mean:.6f}")
+                        
+                except Exception as e:
+                    print(f"[WARN] KL computation error for sample {i}: {e}")
+                    continue
+            
+            # Calculate final statistics
+            if kl_values:
+                mean_kl = sum(kl_values) / len(kl_values)
+                min_kl = min(kl_values)
+                max_kl = max(kl_values)
+                
+                result = {
+                    "task_name": task_name,
+                    "mean_kl": mean_kl,
+                    "min_kl": min_kl,
+                    "max_kl": max_kl,
+                    "num_samples": len(kl_values),
+                    "type": "generative"
+                }
+                
+                print(f"[INFO] Final generative KL stats for {task_name}:")
+                print(f"       Mean: {mean_kl:.6f}")
+                print(f"       Min:  {min_kl:.6f}") 
+                print(f"       Max:  {max_kl:.6f}")
+                print(f"       Samples: {len(kl_values)}")
+                
+                return result
+            else:
+                print(f"[ERROR] No valid KL computations for {task_name}")
+                return {
+                    "task_name": task_name,
+                    "mean_kl": 0.0,
+                    "num_samples": 0,
+                    "type": "generative",
+                    "error": "No valid KL computations"
+                }
+
+
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Calculate KL divergence between two models' outputs")
-    parser.add_argument("base_model_dir", help="Directory with base model tensor files")
-    parser.add_argument("new_model_dir", help="Directory with new model tensor files")
-    parser.add_argument("--output", "-o", help="Output path for KL results")
-    parser.add_argument("--task", "-t", help="Task filter (e.g., 'mmlu' or 'hellaswag')")
-    
+
+    parser = argparse.ArgumentParser(description="Compute KL divergence between two model outputs (new manifest format).")
+    parser.add_argument("base_model_dir", help="Directory with base model tensors")
+    parser.add_argument("new_model_dir", help="Directory with new/quantized model tensors")
+    parser.add_argument("--output", "-o", help="Output file prefix")
+    parser.add_argument("--task", "-t", help="Optional substring filter for task names")
     args = parser.parse_args()
-    
-    kl_eval = KLEval(args.base_model_dir, args.new_model_dir)
-    kl_eval.save_kl_results(args.output, task_filter=args.task)
-        
-        
+
+    kl = KLEval(args.base_model_dir, args.new_model_dir)
+    kl.save_kl_results(args.output, task_filter=args.task)
