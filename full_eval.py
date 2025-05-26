@@ -38,10 +38,10 @@ model_groups = [
     # "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-bnb-4bit"),
     ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
      "RedHatAI/DeepSeek-R1-Distill-Qwen-7B-quantized.w8a8",
-     "RedHatAI/DeepSeek-R1-Distill-Qwen-7B-quantized.w4a16"),
+     ),
     ("meta-llama/Meta-Llama-3-8B-Instruct",
      "RedHatAI/Meta-Llama-3-8B-Instruct-quantized.w8a8",
-     "RedHatAI/Meta-Llama-3-8B-Instruct-quantized.w4a16"),
+     ),
 ]
 
 # Base output directory for all model outputs
@@ -50,40 +50,11 @@ OUTPUT_DIR = "auto_output"  # Top-level directory for all organized outputs
 
 ### Configs for MMLU, ARC-C, GSM8kCOT, HellaSwag, Winogrande, TruthfulQA
 
-hellaswag_config = {
-    "task_name": "hellaswag",
+leaderboard_config = {
+    "task_name": "openllm",
     "log_samples": True,
     "batch_size": 16,
-}
-
-mmlu_config = {
-    "task_name": "mmlu",
-    "log_samples": True,
-    "batch_size": 8,
-}
-
-arc_c_config = {
-    "task_name": "arc_challenge",
-    "log_samples": True,
-    "batch_size": 16,
-}
-
-gsm8kcot_config = {
-    "task_name": "gsm8k",
-    "log_samples": True,
-    "batch_size": 16,
-}
-
-winogrande_config = {
-    "task_name": "winogrande",
-    "log_samples": True,
-    "batch_size": 16,
-}
-
-truthfulqa_config = {
-    "task_name": "truthfulqa",
-    "log_samples": True,
-    "batch_size": 16,
+    "num_fewshot": 0,
 }
 
 def clear_memory():
@@ -364,7 +335,7 @@ def evaluate_model_with_streaming_logits(config, model_name, model_dir, logits_q
         print(f"\nDetected quantized model requiring vLLM: {model_name}")
         config_copy = config.copy()
         config_copy["model"] = "vllm"
-        config_copy["model_args"] = f"pretrained={model_name},max_model_len=4096,gpu_memory_utilization=0.8,tensor_parallel_size=1"
+        config_copy["model_args"] = f"pretrained={model_name},max_model_len=4096,gpu_memory_utilization=0.8,tensor_parallel_size=1,enable_chunked_prefill=True,dtype=auto"
         config_copy["batch_size"] = "auto"
         cleanup_vllm_processes()
     else:
@@ -630,6 +601,7 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
                 cleanup_vllm_processes()
             else:
                 config["model"] = "hf"
+                config["batch_size"] = 16 if task_name != "mmlu" else 8
                 config["model_args"] = f"pretrained={model_name}"
             
             config["limit"] = None  # Set to None for full evaluation or some number for testing
@@ -645,7 +617,7 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
             
             # Initialize the tracker
             eval_tracker = EvaluationTracker(output_path=model_dir)
-            eval_tracker.general_config_tracker.model_name_sanitized = model_name
+            eval_tracker.general_config_tracker.model_name_sanitized = "samples"
             eval_tracker.date_id = datetime.now().isoformat().replace(":", "-")
             
             # Standard evaluation
@@ -902,11 +874,9 @@ if __name__ == "__main__":
     group_dirs = create_directory_structure(model_groups)
     
     # Run evaluations for each config
-    configs = [mmlu_config, arc_c_config, 
-              gsm8kcot_config, winogrande_config, truthfulqa_config]
     
     # # # For testing, you may want to run just one config
-    # configs = [hellaswag_config]
+    configs = [leaderboard_config]
     
     # Create a metadata file with run information
     metadata = {
