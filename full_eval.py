@@ -668,7 +668,12 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
         task_results[base_model] = group_results
     
     # Continue with flip analysis
-    _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False)
+    if config["task_name"] == "openllm":
+        for task in ["mmlu", "hellaswag", "winogrande", "truthfulqa", "arc_challenge", "gsm8k"]:
+            config["task_name"] = task
+            _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False)
+    else:
+        _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False)
 
 def _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False):
     """Run flip evaluation and KL analysis (shared between both approaches)"""
