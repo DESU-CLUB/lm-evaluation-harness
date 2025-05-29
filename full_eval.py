@@ -36,11 +36,11 @@ from lm_eval.loggers import EvaluationTracker
 model_groups = [
     # ("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     # "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-bnb-4bit"),
-    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-     "RedHatAI/DeepSeek-R1-Distill-Qwen-7B-quantized.w8a8",
+    ("unsloth/DeepSeek-R1-Distill-Qwen-7B-bnb-4bit",
+     "jncraton/DeepSeek-R1-Distill-Qwen-7B-ct2-int8"
      ),
-    ("meta-llama/Meta-Llama-3-8B-Instruct",
-     "RedHatAI/Meta-Llama-3-8B-Instruct-quantized.w8a8",
+    ("unsloth/llama-3-8b-bnb-4bit",
+     "astronomer/Llama-3-8B-GPTQ-8-Bit"
      ),
 ]
 
@@ -55,6 +55,7 @@ leaderboard_config = {
     "log_samples": True,
     "batch_size": 16,
     "num_fewshot": 0,
+    "limit":250
 }
 
 def clear_memory():
@@ -171,6 +172,7 @@ def find_task_jsonl_files(group_dir, model_dir, task_name):
     matching_files = []
     
     # First, look in the samples directory
+    print(model_dir)
     samples_dir = os.path.join(full_model_dir, "samples")
     if os.path.exists(samples_dir):
         print(samples_dir)
@@ -191,6 +193,8 @@ def extract_accuracy_from_results(results):
         return results["acc_norm,none"]
     elif "exact_match,strict-match" in results:
         return results["exact_match,strict-match"]
+    elif "exact_match,flexible-extract" in results:
+        return results["exact_match,flexible-extract"]
     elif "mean_acc" in results:
         return results["mean_acc"]
     
@@ -602,7 +606,7 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
             else:
                 config["model"] = "hf"
                 config["batch_size"] = 16 if task_name != "mmlu" else 8
-                config["model_args"] = f"pretrained={model_name}"
+            config["model_args"] = f"pretrained={model_name}"
             
             config["limit"] = None  # Set to None for full evaluation or some number for testing
             
