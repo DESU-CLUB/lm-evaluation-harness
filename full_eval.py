@@ -36,11 +36,9 @@ from lm_eval.loggers import EvaluationTracker
 model_groups = [
     # ("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     # "unsloth/DeepSeek-R1-Distill-Qwen-1.5B-bnb-4bit"),
-    ("unsloth/DeepSeek-R1-Distill-Qwen-7B-bnb-4bit",
-     "jncraton/DeepSeek-R1-Distill-Qwen-7B-ct2-int8"
-     ),
-    ("unsloth/llama-3-8b-bnb-4bit",
-     "astronomer/Llama-3-8B-GPTQ-8-Bit"
+    (#"unsloth/llama-3-8b-Instruct-bnb-4bit",
+     "clowman/Llama-3.1-8B-Instruct-GPTQ-Int8",
+     #"DESUCLUB/Llama-3.1-8B-Instruct-quantized.w8a8"
      ),
 ]
 
@@ -53,9 +51,14 @@ OUTPUT_DIR = "auto_output"  # Top-level directory for all organized outputs
 leaderboard_config = {
     "task_name": "openllm",
     "log_samples": True,
-    "batch_size": 16,
-    "num_fewshot": 0,
-    "limit":250
+    "batch_size": "auto",
+}
+
+testing_config = {
+        "task_name":"helllaswag",
+        "log_samples": True,
+        "batch_size": "auto",
+        "limit": 10
 }
 
 def clear_memory():
@@ -426,7 +429,6 @@ def evaluate_model_with_streaming_logits(config, model_name, model_dir, logits_q
             model=config_copy["model"],
             model_args=config_copy["model_args"],
             tasks=[config_copy["task_name"]],
-            num_fewshot=config_copy.get("num_fewshot", 0),
             batch_size=config_copy.get("batch_size", None),
             limit=config_copy.get("limit", None),
             log_samples=True,
@@ -600,13 +602,16 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
             if is_vllm_model:
                 print(f"\nDetected quantized model requiring vLLM: {model_name}")
                 config["model"] = "vllm"
-                config["model_args"] = f"pretrained={model_name},max_model_len=4096,gpu_memory_utilization=0.8,tensor_parallel_size=1"
+                config["model_args"] = f"pretrained={model_name},max_model_len=4096,gpu_memory_utilization=0.8,tensor_parallel_size=1,allow_chat_template=True"
                 config["batch_size"] = "auto"
                 cleanup_vllm_processes()
             else:
                 config["model"] = "hf"
-                config["batch_size"] = 16 if task_name != "mmlu" else 8
-            config["model_args"] = f"pretrained={model_name}"
+                if "gptq" in model_name.lower():
+                    # For GPTQ models, use autogptq parameter separately
+                    config["model_args"] = f"pretrained={model_name},autogptq=True"
+                else:
+                    config["model_args"] = f"pretrained={model_name}"
             
             config["limit"] = None  # Set to None for full evaluation or some number for testing
             
@@ -629,7 +634,6 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
                 model=config["model"],
                 model_args=config["model_args"],
                 tasks=[config["task_name"]],
-                num_fewshot=config.get("num_fewshot", 0),
                 batch_size=config.get("batch_size", None),
                 limit=config.get("limit", None),
                 log_samples=True,
@@ -885,7 +889,7 @@ if __name__ == "__main__":
     # Run evaluations for each config
     
     # # # For testing, you may want to run just one config
-    configs = [leaderboard_config]
+    configs = [testing_config]
     
     # Create a metadata file with run information
     metadata = {
