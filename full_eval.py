@@ -55,7 +55,7 @@ leaderboard_config = {
 }
 
 testing_config = {
-        "task_name":"helllaswag",
+        "task_name":"hellaswag",
         "log_samples": True,
         "batch_size": "auto",
         "limit": 10
@@ -174,13 +174,29 @@ def find_task_jsonl_files(group_dir, model_dir, task_name):
     full_model_dir = os.path.join(group_dir, model_dir)
     matching_files = []
     
-    # First, look in the samples directory
-    print(model_dir)
-    samples_dir = os.path.join(full_model_dir, "samples")
-    if os.path.exists(samples_dir):
-        print(samples_dir)
-        pattern = os.path.join(samples_dir, f"samples_{task_name}_*.jsonl")
-        matching_files.extend(glob.glob(pattern))
+    # Handle openllm as a collection of subtasks
+    if task_name == "openllm":
+        subtasks = ["mmlu", "hellaswag", "winogrande", "truthfulqa", "arc_challenge", "gsm8k"]
+        print(f"Looking for openllm subtasks: {subtasks}")
+        
+        samples_dir = os.path.join(full_model_dir, "samples")
+        if os.path.exists(samples_dir):
+            for subtask in subtasks:
+                pattern = os.path.join(samples_dir, f"samples_{subtask}_*.jsonl")
+                subtask_files = glob.glob(pattern)
+                matching_files.extend(subtask_files)
+                if subtask_files:
+                    print(f"  Found {len(subtask_files)} files for {subtask}")
+                else:
+                    print(f"  No files found for {subtask}")
+    else:
+        # Handle individual tasks
+        print(f"Looking for individual task: {task_name}")
+        samples_dir = os.path.join(full_model_dir, "samples")
+        if os.path.exists(samples_dir):
+            print(samples_dir)
+            pattern = os.path.join(samples_dir, f"samples_{task_name}_*.jsonl")
+            matching_files.extend(glob.glob(pattern))
 
     if not matching_files:
         print(f"Warning: No JSONL files found for {task_name} in {full_model_dir}")
@@ -578,7 +594,16 @@ def _run_evaluations_with_kl_streaming(config, model_groups, group_dirs):
         task_results[base_model] = group_results
     
     # Continue with flip analysis (same as standard approach)
-    _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=True)
+    if config["task_name"] == "openllm":
+        # For openllm, run flip analysis on each individual subtask
+        openllm_subtasks = ["mmlu", "hellaswag", "winogrande", "truthfulqa", "arc_challenge", "gsm8k"]
+        for subtask in openllm_subtasks:
+            print(f"\nRunning flip analysis for openllm subtask: {subtask}")
+            subtask_config = config.copy()
+            subtask_config["task_name"] = subtask
+            _run_flip_analysis(subtask_config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=True)
+    else:
+        _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=True)
 
 def _run_evaluations_standard(config, model_groups, group_dirs):
     """Run standard evaluations without KL divergence streaming"""
@@ -602,7 +627,7 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
             if is_vllm_model:
                 print(f"\nDetected quantized model requiring vLLM: {model_name}")
                 config["model"] = "vllm"
-                config["model_args"] = f"pretrained={model_name},max_model_len=4096,gpu_memory_utilization=0.8,tensor_parallel_size=1,allow_chat_template=True"
+                config["model_args"] = f"pretrained={model_name},max_model_len=4096,gpu_memory_utilization=0.8,tensor_parallel_size=1"
                 config["batch_size"] = "auto"
                 cleanup_vllm_processes()
             else:
@@ -612,9 +637,7 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
                     config["model_args"] = f"pretrained={model_name},autogptq=True"
                 else:
                     config["model_args"] = f"pretrained={model_name}"
-            
-            config["limit"] = None  # Set to None for full evaluation or some number for testing
-            
+                        
             # Get the model directory
             model_dir = os.path.join(group_dir, get_model_dir(model_name))
             samples_dir = os.path.join(model_dir, "samples")
@@ -677,9 +700,13 @@ def _run_evaluations_standard(config, model_groups, group_dirs):
     
     # Continue with flip analysis
     if config["task_name"] == "openllm":
-        for task in ["mmlu", "hellaswag", "winogrande", "truthfulqa", "arc_challenge", "gsm8k"]:
-            config["task_name"] = task
-            _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False)
+        # For openllm, run flip analysis on each individual subtask
+        openllm_subtasks = ["mmlu", "hellaswag", "winogrande", "truthfulqa", "arc_challenge", "gsm8k"]
+        for subtask in openllm_subtasks:
+            print(f"\nRunning flip analysis for openllm subtask: {subtask}")
+            subtask_config = config.copy()
+            subtask_config["task_name"] = subtask
+            _run_flip_analysis(subtask_config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False)
     else:
         _run_flip_analysis(config, model_groups, group_dirs, task_results, vllm_models, kl_divergence=False)
 
