@@ -32,6 +32,14 @@ gsm8k_config = {
     "limit": None,
 }
 
+mmlu_config = {
+    "task_name": "mmlu",
+    "log_samples": True,
+    "batch_size": 64,
+    "num_fewshot": 0,
+    "limit": None,
+}
+
 
 def clear_memory():
     """Clear memory to prevent OOM issues between evaluations"""
@@ -281,7 +289,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-name", 
         type=str, 
-        default="hellaswag",
+        default="mmlu",
         help="Task name for evaluation (e.g., 'hellaswag', 'openllm', 'gsm8k')"
     )
     parser.add_argument(
@@ -299,7 +307,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch-size", 
         type=int, 
-        default=16,
+        default=64,
         help="Batch size for evaluation"
     )
     parser.add_argument(
