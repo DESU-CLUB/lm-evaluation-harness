@@ -62,6 +62,12 @@ class FlipEval:
         
         print(f"Found {len(self.file_pairs)} matching file pairs")
     
+        base_jsonl_files = [pair[0] for pair in self.file_pairs]
+        new_jsonl_files = [pair[1] for pair in self.file_pairs]
+        
+        base_jsonl_files.sort()
+        new_jsonl_files.sort()
+
     def _initialize_file_comparison(self, base_file_path: str, new_file_path: str):
         """
         Initialize for single file comparison.
@@ -544,10 +550,32 @@ class FlipEval:
             
             # Try different pattern extraction strategies
             
-            # For format: samples_taskname_subtaskname_timestamp.jsonl
+            # For MMLU format: samples_mmlu_subtask_with_underscores_timestamp.jsonl
+            # We need to handle cases like "high_school_computer_science"
+            mmlu_pattern = re.search(r'samples_mmlu_(.+)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d+)\.jsonl$', filename)
+            if mmlu_pattern:
+                subtask_with_timestamp = mmlu_pattern.group(1)
+                # Remove the timestamp part (last section after underscore that matches timestamp pattern)
+                subtask = re.sub(r'_\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d+$', '', subtask_with_timestamp)
+                pattern_key = f"mmlu_{subtask}"
+                file_map[pattern_key] = file_path
+                continue
+            
+            # For format: samples_taskname_subtaskname_timestamp.jsonl (simple cases)
             pattern1 = re.search(r'samples_([^_]+)_([^_]+)_\d', filename)
             if pattern1:
                 task, subtask = pattern1.groups()
+                # Check if this looks like it might have more underscores (for non-MMLU tasks)
+                remaining_filename = filename[pattern1.end()-1:]  # Start from the digit
+                if '_' in subtask and not remaining_filename.startswith('_2'):  # Likely has more parts
+                    # Try to extract the full subtask name up to the timestamp
+                    full_match = re.search(r'samples_([^_]+)_(.+)_(\d{4}-\d{2}-\d{2}T[\d\-\.]+)\.jsonl$', filename)
+                    if full_match:
+                        task, full_subtask, timestamp = full_match.groups()
+                        pattern_key = f"{task}_{full_subtask}"
+                        file_map[pattern_key] = file_path
+                        continue
+                
                 pattern_key = f"{task}_{subtask}"
                 file_map[pattern_key] = file_path
                 continue
@@ -561,7 +589,9 @@ class FlipEval:
                 continue
             
             # Fallback: just use the filename without timestamp as the key
-            pattern_key = re.sub(r'_\d{8}_\d{6}\.jsonl$', '', filename)
+            pattern_key = re.sub(r'_\d{4}-\d{2}-\d{2}T[\d\-\.]+\.jsonl$', '', filename)
+            if pattern_key.startswith('samples_'):
+                pattern_key = pattern_key[8:]  # Remove 'samples_' prefix
             file_map[pattern_key] = file_path
             
         return file_map
@@ -571,7 +601,15 @@ class FlipEval:
         filename = os.path.basename(file_path)
         
         # Try different patterns
-        # samples_mmlu_anatomy_20250522_123456.jsonl -> "anatomy"
+        # For MMLU: samples_mmlu_high_school_computer_science_timestamp.jsonl -> "high_school_computer_science"
+        mmlu_pattern = re.search(r'samples_mmlu_(.+)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d+)\.jsonl$', filename)
+        if mmlu_pattern:
+            subtask_with_timestamp = mmlu_pattern.group(1)
+            # Remove the timestamp part 
+            subtask = re.sub(r'_\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d+$', '', subtask_with_timestamp)
+            return subtask
+        
+        # samples_taskname_subtaskname_timestamp.jsonl -> "subtaskname" (for simple cases)
         pattern1 = re.search(r'samples_[^_]+_([^_]+)_\d', filename)
         if pattern1:
             return pattern1.group(1)
