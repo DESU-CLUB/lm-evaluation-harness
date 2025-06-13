@@ -82,19 +82,17 @@ def run_throughput_benchmark(
             }
 
         # Parse throughput metrics from output
-        # Expected format: "Throughput: X.XX requests/s, Y.YY total tokens/s, Z.ZZ output tokens/s"
+        # Expected format: "Throughput: X.XX requests/s, Y.YY total tokens/s, A.AA input tokens/s, Z.ZZ output tokens/s"
         throughput_match = re.search(
-            r"Throughput:\s*([\d.]+)\s*requests/s,\s*([\d.]+)\s*total tokens/s,\s*([\d.]+)\s*output tokens/s", 
+            r"Throughput:\s*([\d.]+)\s*requests/s,\s*([\d.]+)\s*total tokens/s,\s*([\d.]+)\s*input tokens/s,\s*([\d.]+)\s*output tokens/s", 
             full_output
         )
 
         if throughput_match:
             requests_per_sec = float(throughput_match.group(1))
             total_tokens_per_sec = float(throughput_match.group(2))
-            output_tokens_per_sec = float(throughput_match.group(3))
-            
-            # Calculate input tokens/s (total - output)
-            input_tokens_per_sec = total_tokens_per_sec - output_tokens_per_sec
+            input_tokens_per_sec = float(throughput_match.group(3))
+            output_tokens_per_sec = float(throughput_match.group(4))
             
             return {
                 "model": model,
