@@ -7,6 +7,7 @@ import torch
 import argparse
 from datetime import datetime
 from lm_eval.loggers import EvaluationTracker
+import random
 
 # Configuration examples
 testing_config = {
@@ -35,7 +36,7 @@ gsm8k_config = {
 mmlu_config = {
     "task_name": "mmlu",
     "log_samples": True,
-    "batch_size": 64,
+    "batch_size": 1,
     "num_fewshot": 0,
     "limit": None,
 }
@@ -70,6 +71,7 @@ def evaluate_server_model(
     num_concurrent: int = 1,
     max_retries: int = 3,
     tokenized_requests: bool = False,
+    num_seeds: int = 5,
 ):
     """
     Evaluate a model served via API endpoint using lm_eval.
@@ -82,6 +84,7 @@ def evaluate_server_model(
         num_concurrent: Number of concurrent requests
         max_retries: Number of retry attempts
         tokenized_requests: Whether to use tokenized requests
+        num_seeds: Number of different seeds to evaluate with
     """
 
     task_name = config["task_name"]
@@ -106,7 +109,7 @@ def evaluate_server_model(
         f"num_concurrent={num_concurrent},"
         f"max_retries={max_retries},"
         f"tokenized_requests={tokenized_requests},"
-        f"batch_size={config.get('batch_size', 16)}"
+        f"batch_size={config.get('batch_size', 16)},"
     )
 
     print(f"Model args: {model_args}")
@@ -119,68 +122,82 @@ def evaluate_server_model(
     eval_tracker.general_config_tracker.model_name_sanitized = "samples"
     eval_tracker.date_id = datetime.now().isoformat().replace(":", "-")
 
+    all_results = []
+    all_samples = []
+
     try:
-        # Run the evaluation
-        print(f"\nStarting evaluation...")
-        results = lm_eval.simple_evaluate(
-            model="local-completions",
-            model_args=model_args,
-            tasks=[task_name],
-            limit=config.get("limit", None),
-            log_samples=config.get("log_samples", True),
-            num_fewshot=config.get("num_fewshot", 0),
-        )
+        # Run the evaluation for each seed
+        for seed in range(num_seeds):
+            print(f"\nStarting evaluation with seed {seed}...")
+            seed_results = lm_eval.simple_evaluate(
+                model="local-completions",
+                model_args=model_args,
+                tasks=[task_name],
+                limit=config.get("limit", None),
+                log_samples=config.get("log_samples", True),
+                num_fewshot=config.get("num_fewshot", 0),
+                apply_chat_template=True,
+                random_seed= random.randint(0, 1000000),
+                numpy_random_seed= random.randint(0, 1000000),
+                torch_random_seed= random.randint(0, 1000000),
+                fewshot_random_seed= random.randint(0, 1000000),
+            )
+            
+            all_results.append(seed_results)
+            if "samples" in seed_results:
+                all_samples.append(seed_results.pop("samples"))
+            
+            print(f"✅ Evaluation with seed {seed} completed successfully!")
 
-        print(f"✅ Evaluation completed successfully!")
+        # Calculate average results
+        avg_results = {}
+        for metric in all_results[0]["results"][task_name].keys():
+            values = [r["results"][task_name][metric] for r in all_results]
+            avg_results[metric] = sum(values) / len(values)
 
-        # Generate markdown table of results
-        md = lm_eval.utils.make_table(results)
+        # Save individual seed results
+        for seed, seed_results in enumerate(all_results):
+            seed_dir = os.path.join(model_dir, f"seed_{seed}")
+            os.makedirs(seed_dir, exist_ok=True)
+            
+            # Save results as markdown
+            md = lm_eval.utils.make_table(seed_results)
+            results_filename = os.path.join(seed_dir, f"{task_name}_results.md")
+            with open(results_filename, "w") as f:
+                f.write(md)
+            
+            # Save raw results as JSON
+            results_json_filename = os.path.join(seed_dir, f"{task_name}_results.json")
+            with open(results_json_filename, "w") as f:
+                json.dump(seed_results["results"][task_name], f, indent=2)
 
-        # Extract and save samples if they exist
-        if "samples" in results:
-            samples = results.pop("samples")
-            for task_name_key, task_samples in samples.items():
-                eval_tracker.save_results_samples(
-                    task_name=task_name_key, samples=task_samples
-                )
-                print(f"📁 Samples for {task_name_key} saved to {model_dir}")
+        # Save average results
+        avg_results_filename = os.path.join(model_dir, f"{task_name}_avg_results.json")
+        with open(avg_results_filename, "w") as f:
+            json.dump(avg_results, f, indent=2)
+        print(f"📊 Average results saved to {avg_results_filename}")
 
-        # Extract the results for this task
-        results_dict = results["results"][task_name]
+        # Save all samples if they exist
+        if all_samples:
+            samples_dir = os.path.join(model_dir, "samples")
+            os.makedirs(samples_dir, exist_ok=True)
+            for seed, samples in enumerate(all_samples):
+                for task_name_key, task_samples in samples.items():
+                    eval_tracker.save_results_samples(
+                        task_name=f"{task_name_key}_seed_{seed}", 
+                        samples=task_samples
+                    )
 
-        # Save results as markdown
-        results_filename = os.path.join(model_dir, f"{task_name}_results.md")
-        with open(results_filename, "w") as f:
-            f.write(md)
-        print(f"📄 Results saved to {results_filename}")
-
-        # Save raw results as JSON
-        results_json_filename = os.path.join(model_dir, f"{task_name}_results.json")
-        with open(results_json_filename, "w") as f:
-            json.dump(results_dict, f, indent=2)
-        print(f"📊 Raw results saved to {results_json_filename}")
-
-        # Save full results with metadata
-        full_results_filename = os.path.join(
-            model_dir, f"{task_name}_full_results.json"
-        )
-        with open(full_results_filename, "w") as f:
-            json.dump(results, f, indent=2)
-
-        # Extract main accuracy metric
-        accuracy = extract_accuracy_from_results(results_dict)
-        if accuracy is not None:
-            print(f"🎯 Main accuracy metric: {accuracy:.4f}")
-
-        # Create summary
+        # Create summary with average results
         summary = {
             "model_name": model_name,
             "task_name": task_name,
             "server_url": base_url,
-            "accuracy": accuracy,
+            "num_seeds": num_seeds,
+            "average_accuracy": extract_accuracy_from_results(avg_results),
             "config": config,
             "timestamp": datetime.now().isoformat(),
-            "results": results_dict,
+            "average_results": avg_results,
         }
 
         summary_filename = os.path.join(model_dir, f"{task_name}_summary.json")
@@ -188,7 +205,7 @@ def evaluate_server_model(
             json.dump(summary, f, indent=2)
         print(f"📋 Summary saved to {summary_filename}")
 
-        return results
+        return avg_results
 
     except Exception as e:
         print(f"❌ Error during evaluation: {e}")
@@ -223,6 +240,7 @@ def evaluate_multiple_tasks(
     base_url: str,
     configs: list,
     output_dir: str = "server_eval_output",
+    num_seeds: int = 5,
 ):
     """
     Evaluate a server model on multiple tasks.
@@ -232,6 +250,7 @@ def evaluate_multiple_tasks(
         base_url: Server endpoint URL
         configs: List of configuration dictionaries
         output_dir: Output directory for results
+        num_seeds: Number of seeds for evaluation
     """
     results = {}
 
@@ -243,6 +262,7 @@ def evaluate_multiple_tasks(
                 model_name=model_name,
                 base_url=base_url,
                 output_dir=output_dir,
+                num_seeds=num_seeds,
             )
             results[config["task_name"]] = task_results
 
@@ -262,89 +282,83 @@ def evaluate_multiple_tasks(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Evaluate a model served via API endpoint using lm_eval",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    
+
     # Model and server configuration
     parser.add_argument(
-        "--model-name", 
-        type=str, 
+        "--model-name",
+        type=str,
         required=True,
-        help="Name of the model (e.g., 'facebook/opt-125m')"
+        help="Name of the model (e.g., 'facebook/opt-125m')",
     )
     parser.add_argument(
-        "--base-url", 
-        type=str, 
-        default="http://0.0.0.0:8000/v1/completions",
-        help="Server endpoint URL"
+        "--base-url",
+        type=str,
+        default="http://0.0.0.0:8000/v1/chat/completions",
+        help="Server endpoint URL",
     )
     parser.add_argument(
-        "--output-dir", 
-        type=str, 
+        "--output-dir",
+        type=str,
         default="server_eval_output",
-        help="Directory to save results"
+        help="Directory to save results",
     )
-    
+
     # Evaluation configuration
     parser.add_argument(
-        "--task-name", 
-        type=str, 
-        default="mmlu",
-        help="Task name for evaluation (e.g., 'hellaswag', 'openllm', 'gsm8k')"
+        "--task-name",
+        type=str,
+        default="mmlu_generative",
+        help="Task name for evaluation (e.g., 'hellaswag', 'openllm', 'gsm8k')",
     )
     parser.add_argument(
-        "--log-samples", 
-        action="store_true", 
+        "--log-samples",
+        action="store_true",
         default=True,
-        help="Whether to log samples"
+        help="Whether to log samples",
     )
     parser.add_argument(
-        "--no-log-samples", 
-        action="store_false", 
+        "--no-log-samples",
+        action="store_false",
         dest="log_samples",
-        help="Disable logging samples"
+        help="Disable logging samples",
     )
     parser.add_argument(
-        "--batch-size", 
-        type=int, 
-        default=64,
-        help="Batch size for evaluation"
+        "--batch-size", type=int, default=16, help="Batch size for evaluation"
     )
     parser.add_argument(
-        "--num-fewshot", 
-        type=int, 
-        default=0,
-        help="Number of few-shot examples"
+        "--num-fewshot", type=int, default=0, help="Number of few-shot examples"
     )
     parser.add_argument(
-        "--limit", 
-        type=int, 
+        "--limit",
+        type=int,
         default=None,
-        help="Limit number of samples for testing (None for no limit)"
+        help="Limit number of samples for testing (None for no limit)",
     )
-    
+
     # Server request configuration
     parser.add_argument(
-        "--num-concurrent", 
-        type=int, 
-        default=1,
-        help="Number of concurrent requests"
+        "--num-concurrent", type=int, default=16, help="Number of concurrent requests"
     )
     parser.add_argument(
-        "--max-retries", 
-        type=int, 
-        default=3,
-        help="Number of retry attempts"
+        "--max-retries", type=int, default=3, help="Number of retry attempts"
     )
     parser.add_argument(
-        "--tokenized-requests", 
-        action="store_true", 
+        "--tokenized-requests",
+        action="store_true",
         default=False,
-        help="Whether to use tokenized requests"
+        help="Whether to use tokenized requests",
     )
-    
+    parser.add_argument(
+        "--num-seeds",
+        type=int,
+        default=5,
+        help="Number of seeds for evaluation averaging",
+    )
+
     args = parser.parse_args()
-    
+
     # Create configuration dict from arguments
     config = {
         "task_name": args.task_name,
@@ -353,7 +367,7 @@ if __name__ == "__main__":
         "num_fewshot": args.num_fewshot,
         "limit": args.limit,
     }
-    
+
     print("🔧 Running evaluation with configuration:")
     print(f"  Model: {args.model_name}")
     print(f"  Task: {args.task_name}")
@@ -362,7 +376,8 @@ if __name__ == "__main__":
     print(f"  Few-shot: {args.num_fewshot}")
     print(f"  Limit: {args.limit}")
     print(f"  Log samples: {args.log_samples}")
-    
+    print(f"  Number of seeds: {args.num_seeds}")
+
     # Run evaluation
     try:
         results = evaluate_server_model(
@@ -373,9 +388,10 @@ if __name__ == "__main__":
             num_concurrent=args.num_concurrent,
             max_retries=args.max_retries,
             tokenized_requests=args.tokenized_requests,
+            num_seeds=args.num_seeds,
         )
         print("✅ Evaluation completed successfully!")
-        
+
     except Exception as e:
         print(f"❌ Evaluation failed: {e}")
         exit(1)
